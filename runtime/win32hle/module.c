@@ -164,6 +164,10 @@ static void k_GetProcAddress(void) {                     /* (hModule, name or or
         } else {
             va = hle_resolve((const char *)G2H(n));
         }
+    } else if (i >= 0 && n >= 0x10000u) {
+        /* A DLL that was mapped: its own code is not run, but a host may have
+         * its exports by name (vorbisfile's ov_read...). */
+        va = hle_resolve((const char *)G2H(n));
     }
     if (!va) {
         fprintf(stderr, "[module] GetProcAddress(%s, %s%s): not answered\n", i >= 0 ? g_mod[i].base_name : "?",

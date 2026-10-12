@@ -117,6 +117,7 @@ void hle_audio_stream_close(int id) {
     pthread_mutex_unlock(&g_mix);
 }
 
+void (*hle_dsound_tap)(const int16_t *stereo, int frames, int rate);
 static void mix(void *ud, Uint8 *stream, int len) {
     (void)ud;
     int frames = len / 4;
@@ -158,6 +159,7 @@ static void mix(void *ud, Uint8 *stream, int len) {
         float v = acc[k] * g_master * 32767.0f;
         out[k] = (int16_t)(v > 32767.0f ? 32767 : v < -32768.0f ? -32768 : v);
     }
+    if (hle_dsound_tap) hle_dsound_tap(out, frames, OUT_RATE);
 }
 
 static int audio_open(void) {

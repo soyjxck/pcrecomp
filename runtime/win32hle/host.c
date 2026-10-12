@@ -32,6 +32,7 @@ void recomp_host_init(void) {
     win32hle_register(win32hle_bink);
     win32hle_register(win32hle_d3d9);
     win32hle_register(win32hle_d3dx9);
+    win32hle_register(win32hle_vorbisfile);
 }
 
 static int boot(const char *path, uint32_t (*resolve)(const char *)) {

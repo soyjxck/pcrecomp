@@ -273,6 +273,7 @@ int  hle_dd_frame(const uint8_t **px, int *w, int *h, int *pitch, int *bpp, cons
 void hle_dd_mode(int *w, int *h, int *bpp);
 int  hle_dd_surface_pixels(uint32_t obj, uint8_t **px, int *w, int *h, int *pitch, int *bpp);   /* 0: not a surface */
 void hle_dsound_set_master(float gain);              /* 0 mutes */
+extern void (*hle_dsound_tap)(const int16_t *stereo, int frames, int rate);   /* what was just mixed, on the audio thread */
 /* A host's own sound (a movie's), mixed with the game's buffers: interleaved
  * s16 pushed at its own rate. */
 int  hle_audio_stream_open(int rate, int channels);   /* an id, or -1 with no audio */
@@ -282,6 +283,7 @@ void hle_audio_stream_gain(int id, float gain);
 void hle_audio_stream_close(int id);
 int  hle_file_fd(uint32_t handle);                    /* a file HANDLE's descriptor, or -1 */
 extern const win32hle_shim win32hle_bink[];           /* binkw32 on ffmpeg (bink.c; stubs without HLE_WITH_FFMPEG) */
+extern const win32hle_shim win32hle_vorbisfile[];     /* vorbisfile.dll's ov_* by name, on stb_vorbis (vorbisfile.c) */
 /* Direct3D 9 on OpenGL ES 3 (d3d9.c, d3d9_gl.c) and the D3DX it is used with
  * (d3dx9.c, d3d9_vs.c): empty tables without HLE_WITH_D3D9. The device opens
  * its own SDL window, or with hle_d3d9_headless set draws with no window. */

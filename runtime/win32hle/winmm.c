@@ -119,7 +119,67 @@ static void m_waveOutGetDevCapsA(void) { RET(MMSYSERR_NOERROR, 3); }
 static void m_mciSendStringA(void)     { RET(MMSYSERR_ERROR, 4); }
 static void m_mciGetErrorStringA(void) { RET(0, 3); }          /* FALSE: no string */
 
+/* --- mmio: a RIFF file read chunk by chunk (a wave file's format, then its
+ * samples). Files on disk only; a file in memory is refused. --- */
+#define MAX_MMIO 16
+#define MMIO_BASE 0x00770000u
+#define MMIOERR_CHUNKNOTFOUND 265u
+static FILE *g_mmio[MAX_MMIO];
+static FILE *mmio_of(uint32_t h) { return h >= MMIO_BASE && h < MMIO_BASE + MAX_MMIO ? g_mmio[h - MMIO_BASE] : NULL; }
+static void m_mmioOpenW(void) {                /* (wide name, &MMIOINFO, flags) */
+    char guest[600], host[1024];
+    uint32_t name = A32(0), n = 0;
+    int seat = -1;
+    for (int i = 0; i < MAX_MMIO; i++) if (!g_mmio[i]) { seat = i; break; }
+    if (!name || seat < 0) RET(0, 3);
+    for (; n < sizeof guest - 1 && MEM16(name + 2 * n); n++) guest[n] = (char)MEM16(name + 2 * n);
+    guest[n] = 0;
+    if (!hle_host_path(guest, host, sizeof host) || !(g_mmio[seat] = fopen(host, "rb"))) RET(0, 3);
+    RET(MMIO_BASE + (uint32_t)seat, 3);
+}
+static void m_mmioClose(void) {                /* (file, flags) */
+    FILE *f = mmio_of(A32(0));
+    if (f) fclose(f), g_mmio[A32(0) - MMIO_BASE] = NULL;
+    RET(0, 2);
+}
+static void m_mmioRead(void) {                 /* (file, to, bytes): how many were read, -1 if none can be */
+    FILE *f = mmio_of(A32(0));
+    if (!f || !A32(1)) RET(0xFFFFFFFFu, 3);
+    RET((uint32_t)fread(G2H(A32(1)), 1, A32(2), f), 3);
+}
+static void m_mmioSeek(void) {                 /* (file, offset, from where): the new place */
+    FILE *f = mmio_of(A32(0));
+    if (!f || fseek(f, (long)(int32_t)A32(1), A32(2) == 1 ? SEEK_CUR : A32(2) == 2 ? SEEK_END : SEEK_SET) != 0) RET(0xFFFFFFFFu, 3);
+    RET((uint32_t)ftell(f), 3);
+}
+/* MMCKINFO: the chunk's name, its size, its type (RIFF and LIST chunks have
+ * one), where its data starts, flags. Descending finds the next chunk, or
+ * the next of the name or type asked for, inside the parent if one is given,
+ * and leaves the file at its data. */
+static void m_mmioDescend(void) {              /* (file, &chunk, &parent, flags) */
+    FILE *f = mmio_of(A32(0));
+    uint32_t ck = A32(1), parent = A32(2), flags = A32(3);
+    if (!f || !ck) RET(MMIOERR_CHUNKNOTFOUND, 4);
+    uint32_t want = MEM32(ck), want_type = MEM32(ck + 8);
+    long end = parent ? (long)(MEM32(parent + 12) + MEM32(parent + 4)) : 0;
+    for (;;) {
+        long at = ftell(f);
+        uint32_t head[2], type = 0;
+        if ((parent && at + 8 > end) || fread(head, 4, 2, f) != 2) RET(MMIOERR_CHUNKNOTFOUND, 4);
+        int group = head[0] == 0x46464952u || head[0] == 0x5453494Cu;        /* RIFF, LIST */
+        if (group && fread(&type, 4, 1, f) != 1) RET(MMIOERR_CHUNKNOTFOUND, 4);
+        if (!(flags & 0x70u) || ((flags & 0x10u) && head[0] == want) || ((flags & 0x20u) && head[0] == 0x46464952u && type == want_type) ||
+            ((flags & 0x40u) && head[0] == 0x5453494Cu && type == want_type)) {
+            MEM32(ck) = head[0], MEM32(ck + 4) = head[1], MEM32(ck + 8) = type, MEM32(ck + 12) = (uint32_t)at + 8, MEM32(ck + 16) = 0;
+            RET(0, 4);
+        }
+        fseek(f, at + 8 + (long)head[1] + (long)(head[1] & 1), SEEK_SET);   /* chunks start on even offsets */
+    }
+}
+
 const win32hle_shim win32hle_winmm[] = {
+    { "mmioOpenW", m_mmioOpenW }, { "mmioClose", m_mmioClose }, { "mmioRead", m_mmioRead }, { "mmioSeek", m_mmioSeek },
+    { "mmioDescend", m_mmioDescend },
     { "timeGetTime",            m_timeGetTime },
     { "timeBeginPeriod",        m_timeBeginPeriod },
     { "timeEndPeriod",          m_timeEndPeriod },
