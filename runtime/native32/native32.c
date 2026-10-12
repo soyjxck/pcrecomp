@@ -376,6 +376,10 @@ static native32_shim_t* g_shims;
 static int g_nshims;
 #define IS_SHIM_VA(va) (g_shim_page && (va) >= g_shim_page && (va) < g_shim_page + 0x10000u)
 
+/* A C++ exception a native callee throws out through the bridge (eh32.c). */
+static int foreign_throw_filter(EXCEPTION_POINTERS* ep, uint32_t* obj, uint32_t* info);
+static void foreign_throw(uint32_t obj, uint32_t info, const char* callee);
+
 static void native_bridge(void) {
     /* The guest's last error, as the previous native call left it: the trace
      * below and mach_leave's TlsGetValue would reset it before this call. */
@@ -422,7 +426,18 @@ static void native_bridge(void) {
      * returns with ebx and ebp changed. So ebp, esi and ebx are saved on the
      * stack, and the esp anchor is kept in this thread's TEB
      * (ArbitraryUserPointer, fs:[0x14], its old value saved and put back, so a
-     * nested bridge through a callback unwinds in order). */
+     * nested bridge through a callback unwinds in order).
+     *
+     * The callee can also leave by throwing. A C++ exception from a native
+     * library is raised on the host's SEH chain, where no lifted function has
+     * a frame, so the guest's catch for it never ran and the process died as
+     * an unhandled throw: Trails in the Sky calls the GOG Galaxy SDK's Init
+     * inside try { } catch (const galaxy::api::IError&), and without the
+     * Galaxy client that call always throws. The __except takes any C++
+     * throw the callee did not catch itself and hands it to the guest's own
+     * frames (foreign_throw, eh32.c). */
+    uint32_t thrown_obj = 0, thrown_info = 0;
+    __try {
     __asm {
         fnstsw ax
         mov  sw0, ax             ; x87 TOP before
@@ -455,6 +470,18 @@ static void native_bridge(void) {
         fxam                     ; C3..C0 classify st(0)
         fnstsw ax
         mov  sw1, ax             ; x87 TOP after
+    }
+    } __except (foreign_throw_filter(GetExceptionInformation(), &thrown_obj, &thrown_info)) {
+        /* The unwind dropped the stack the asm built without running its
+         * epilogue: put back the TEB word it borrowed, whose old value sits
+         * just above the copied arguments. Read before anything is called,
+         * while that memory is still as the asm left it. */
+        uint32_t anchor = __readfsdword(0x14);
+        __writefsdword(0x14, *(const uint32_t*)(uintptr_t)(anchor + BRIDGE_SLOTS * 4));
+        const char* callee = g_cur_import;
+        mach_enter();                           /* the registers as the guest had them at the call */
+        g_cur_import = saved_import;
+        foreign_throw(thrown_obj, thrown_info, callee);   /* does not return */
     }
     /* A float result comes back in st(0): TOP moved down by exactly one and
      * st(0) is not empty. A native fninit/_fpreset also moves TOP; without the

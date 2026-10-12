@@ -186,6 +186,47 @@ static int dispatch(uint32_t obj, uint32_t info) {
     return 0;
 }
 
+/* ---- throws from native code ------------------------------------------------
+ * A native library the guest calls (an import, a COM method) can throw a C++
+ * exception for the guest to catch. It is raised on the host's SEH chain; the
+ * bridge's __except (native32.c) is the only frame between the thrower and
+ * the lifted code, so it takes the throw there and dispatches it over the
+ * guest's frames exactly as a guest throw.
+ *
+ * The filter runs while the thrower's frames are still on the stack, which is
+ * where the exception object lives, and the unwind that follows frees them. So
+ * the object is copied out first, bit for bit: the original is never
+ * destroyed, so what it owns (a message string on the heap) stays valid for
+ * the copy. Nothing frees the copy; a throw across this boundary is rare. */
+#define EH_CXX_CODE 0xE06D7363u
+
+static int foreign_throw_filter(EXCEPTION_POINTERS* ep, uint32_t* obj, uint32_t* info) {
+    const EXCEPTION_RECORD* r = ep->ExceptionRecord;
+    if (r->ExceptionCode != EH_CXX_CODE || r->NumberParameters < 3) return EXCEPTION_CONTINUE_SEARCH;
+    uint32_t src = (uint32_t)r->ExceptionInformation[1], ti = (uint32_t)r->ExceptionInformation[2];
+    if (!src || !ti) return EXCEPTION_CONTINUE_SEARCH;      /* a rethrow with nothing to rethrow */
+    uint32_t arr = MEM32(ti + 12);
+    uint32_t ct = MEM32(arr) ? MEM32(arr + 4) : 0;          /* the thrown type itself comes first */
+    uint32_t size = ct ? MEM32(ct + 20) : 0;
+    if (!size || size > (1u << 20)) return EXCEPTION_CONTINUE_SEARCH;
+    void* copy = malloc(size);
+    if (!copy) return EXCEPTION_CONTINUE_SEARCH;
+    memcpy(copy, (const void*)(uintptr_t)src, size);
+    *obj = (uint32_t)(uintptr_t)copy;
+    *info = ti;
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static void foreign_throw(uint32_t obj, uint32_t info, const char* callee) {
+    uint32_t ct = MEM32(MEM32(info + 12) + 4);
+    const char* type = (const char*)(uintptr_t)(MEM32(ct + 4) + 8);
+    dispatch(obj, info);                                    /* returns only if nothing catches */
+    fprintf(stderr, "\n[eh32] %s threw %s and nothing in the guest catches it (called from sub_%08X)\n",
+            callee, type, g_cur_func);
+    recomp_trace_flush();
+    TerminateProcess(GetCurrentProcess(), 3);
+}
+
 typedef void (__stdcall *cxx_throw_t)(void*, void*);
 
 /* _CxxThrowException(object, ThrowInfo), stdcall, in the lifted model. */
