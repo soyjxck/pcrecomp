@@ -248,6 +248,23 @@ static void k_FileTimeToSystemTime(void) {               /* (&ft, &st) */
     put_systemtime(A32(1), &t, (int)(ft % 10000000ull / 10000u));
     RET(1, 2);
 }
+/* newlib (the Switch) has neither timegm nor a time zone: UTC is local time
+ * there, and a file's times cannot be set. */
+#ifdef __SWITCH__
+static time_t hle_timegm(const struct tm *t) {
+    /* days from 1970-01-01 to the civil date (Howard Hinnant's algorithm) */
+    int y = t->tm_year + 1900, m = t->tm_mon + 1;
+    y -= m <= 2;
+    long era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);
+    unsigned doy = (153u * (unsigned)(m + (m > 2 ? -3 : 9)) + 2u) / 5u + (unsigned)t->tm_mday - 1u;
+    unsigned doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
+    long long days = era * 146097LL + (long long)doe - 719468LL;
+    return (time_t)(days * 86400LL + t->tm_hour * 3600LL + t->tm_min * 60LL + t->tm_sec);
+}
+#define timegm hle_timegm
+#endif
+
 static void k_SystemTimeToFileTime(void) {               /* (&st, &ft) */
     const uint16_t *w = (const uint16_t *)APTR(0);
     struct tm t = { 0 };
@@ -258,8 +275,12 @@ static void k_SystemTimeToFileTime(void) {               /* (&st, &ft) */
     RET(1, 2);
 }
 static int32_t tz_bias_s(void) {                         /* local - UTC, seconds */
+#ifdef __SWITCH__
+    return 0;
+#else
     time_t now = time(NULL); struct tm t; localtime_r(&now, &t);
     return (int32_t)t.tm_gmtoff;
+#endif
 }
 static void k_FileTimeToLocalFileTime(void) { put_ft(A32(1), get_ft(A32(0)) + (int64_t)tz_bias_s() * 10000000); RET(1, 2); }
 static void k_LocalFileTimeToFileTime(void) { put_ft(A32(1), get_ft(A32(0)) - (int64_t)tz_bias_s() * 10000000); RET(1, 2); }
@@ -298,6 +319,9 @@ static void k_GetFileTime(void) {                        /* (h, &create, &access
     put_ft(A32(3), unix_to_ft(st.st_mtim.tv_sec, st.st_mtim.tv_nsec));
     RET(1, 4);
 }
+#ifdef __SWITCH__
+static void k_SetFileTime(void) { RET(fd_of(A32(0)) >= 0 ? 1u : 0u, 4); }   /* accepted, not done */
+#else
 static void k_SetFileTime(void) {                        /* (h, &create, &access, &write) */
     int fd = fd_of(A32(0));
     struct timespec ts[2] = { { 0, UTIME_OMIT }, { 0, UTIME_OMIT } };
@@ -309,6 +333,7 @@ static void k_SetFileTime(void) {                        /* (h, &create, &access
     }
     RET(fd >= 0 && futimens(fd, ts) == 0 ? 1u : 0u, 4);
 }
+#endif
 
 static uint32_t attrs_of(const struct stat *st) {
     uint32_t a = S_ISDIR(st->st_mode) ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_ARCHIVE;

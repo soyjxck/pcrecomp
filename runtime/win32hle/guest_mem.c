@@ -35,12 +35,33 @@
 #include <string.h>
 #include <pthread.h>
 #include <unistd.h>
-#include <sys/mman.h>
 #include "win32hle.h"
 
+/* A host with no mmap (the Switch: newlib, and no way for a homebrew program
+ * to reserve address space without committing it) keeps the guest in ONE
+ * ALLOCATED BLOCK of HLE_GUEST_ARENA bytes instead of a 4 GB reservation.
+ * Guest addresses are offsets into it just the same; what changes is that
+ * the space ends at the block's size and that everything without an address
+ * of its own is placed low, straight after the image, so the block can be a
+ * few hundred megabytes. */
+#if defined(__SWITCH__) && !defined(HLE_GUEST_ARENA)
+#define HLE_GUEST_ARENA 0x20000000u      /* 512 MB */
+#endif
+#ifdef HLE_GUEST_ARENA
+#include <malloc.h>
+#else
+#include <sys/mman.h>
+#endif
+
 #define GUEST_LOW   0x00010000u          /* below: never mapped */
-#define GUEST_DYN   0x10000000u          /* where anything without an address goes */
 #define GUEST_TOP   0x7E000000u          /* the pseudo-modules and shim VAs start here */
+#ifdef HLE_GUEST_ARENA
+#define GUEST_DYN   0x02000000u          /* where anything without an address goes */
+#define GUEST_END   ((uint32_t)(HLE_GUEST_ARENA))   /* where guest memory ends */
+#else
+#define GUEST_DYN   0x10000000u
+#define GUEST_END   GUEST_TOP
+#endif
 #define GRAN        0x10000u             /* allocation granularity, as Windows' */
 #define CHUNK       (1u << 20)           /* a heap chunk */
 #define HDR         16u
@@ -69,6 +90,13 @@ static int is64(void) { return sizeof(void *) > 4; }
 static void init_locked(void) {
     if (g_inited) return;
     g_inited = 1;
+#ifdef HLE_GUEST_ARENA
+    g_page = 0x1000;
+    void *block = memalign(GRAN, HLE_GUEST_ARENA);
+    if (!block) { fprintf(stderr, "[guest] cannot allocate %u MB for the guest\n", (unsigned)(HLE_GUEST_ARENA >> 20)); abort(); }
+    g_mem_base = (ptrdiff_t)(uintptr_t)block;
+    return;
+#else
     g_page = (size_t)sysconf(_SC_PAGESIZE);
     if (!is64()) { g_mem_base = 0; return; }             /* flat: a VA is a host address */
     /* The whole 4 GB, read-write but untouched (so unbacked), except the
@@ -80,6 +108,7 @@ static void init_locked(void) {
         fprintf(stderr, "[guest] cannot make the guest space writable\n"); abort();
     }
     g_mem_base = (ptrdiff_t)(uintptr_t)m;
+#endif
 }
 static void init(void) { lock(); init_locked(); unlock(); }
 int hle_guest_init(void) { init(); return 0; }
@@ -130,10 +159,13 @@ static uint32_t round_gran(uint32_t v) { return (v + GRAN - 1) & ~(GRAN - 1); }
 uint32_t hle_guest_map(uint32_t va, uint32_t size) {
     init();
     uint32_t lo = va & ~(GRAN - 1), hi = round_gran(va + size);
-    if (lo < GUEST_LOW || hi > GUEST_TOP || hi <= lo) return 0;
+    if (lo < GUEST_LOW || hi > GUEST_END || hi <= lo) return 0;
     lock();
     if (overlaps(lo, hi - lo) || !region_add(lo, hi - lo)) { unlock(); return 0; }
     unlock();
+#ifdef HLE_GUEST_ARENA
+    memset((void *)ADDR(lo), 0, hi - lo);                /* allocated memory is not zero until made so */
+#else
     if (!is64()) {
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000
@@ -141,6 +173,7 @@ uint32_t hle_guest_map(uint32_t va, uint32_t size) {
         void *p = mmap((void *)(uintptr_t)lo, hi - lo, PROT_READ | PROT_WRITE, MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (p == MAP_FAILED || (uint32_t)(uintptr_t)p != lo) { if (p != MAP_FAILED) munmap(p, hi - lo); hle_guest_unmap(lo, hi - lo); return 0; }
     }
+#endif
     return va;
 }
 /* Memory anywhere: a 64 KB-aligned VA, zero-filled. */
@@ -148,6 +181,7 @@ uint32_t hle_guest_map_any(uint32_t size) {
     init();
     size = round_gran(size);
     if (!size) return 0;
+#ifndef HLE_GUEST_ARENA
     if (!is64()) {
         void *p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (p == MAP_FAILED) return 0;
@@ -156,10 +190,11 @@ uint32_t hle_guest_map_any(uint32_t size) {
         unlock();
         return (uint32_t)(uintptr_t)p;
     }
+#endif
     lock();
     uint32_t va = g_cursor;
     for (int tries = 0; tries < MAX_REGIONS; tries++) {  /* first fit from the cursor, wrapping once */
-        if (va + size > GUEST_TOP || va + size < va) { va = GUEST_DYN; }
+        if (va + size > GUEST_END || va + size < va) { va = GUEST_DYN; }
         if (!overlaps(va, size)) break;
         /* step past the region in the way */
         uint32_t next = 0xFFFFFFFFu;
@@ -170,7 +205,7 @@ uint32_t hle_guest_map_any(uint32_t size) {
             }
         va = round_gran(next);
     }
-    if (overlaps(va, size) || va + size > GUEST_TOP || !region_add(va, size)) {
+    if (overlaps(va, size) || va + size > GUEST_END || !region_add(va, size)) {
         unlock();
         fprintf(stderr, "[guest] out of guest address space (%u bytes)\n", size);
         return 0;
@@ -186,8 +221,10 @@ void hle_guest_unmap(uint32_t va, uint32_t size) {
     for (int i = 0; i < g_nregion; i++)
         if (g_region[i].va == lo) { g_region[i] = g_region[--g_nregion]; break; }
     unlock();
-    if (!is64()) munmap((void *)(uintptr_t)lo, hi - lo);
-    else hle_guest_decommit(lo, hi - lo);
+#ifndef HLE_GUEST_ARENA
+    if (!is64()) { munmap((void *)(uintptr_t)lo, hi - lo); return; }
+#endif
+    hle_guest_decommit(lo, hi - lo);
 }
 /* Give the pages back; they read as zero when touched again. */
 void hle_guest_decommit(uint32_t va, uint32_t size) {
@@ -195,7 +232,11 @@ void hle_guest_decommit(uint32_t va, uint32_t size) {
     uintptr_t a = ADDR(va), e = ADDR(va) + size;
     a = (a + g_page - 1) & ~(g_page - 1);
     e &= ~(g_page - 1);
+#ifdef HLE_GUEST_ARENA
+    if (e > a) memset((void *)a, 0, e - a);              /* nothing to hand back; only the promise of zeros */
+#else
     if (e > a) madvise((void *)a, e - a, MADV_DONTNEED);
+#endif
 }
 int hle_guest_region_of(uint32_t va, uint32_t *base, uint32_t *size) {
     int found = 0;

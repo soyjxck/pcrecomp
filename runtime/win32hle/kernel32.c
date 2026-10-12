@@ -18,7 +18,6 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <sched.h>
-#include <sys/mman.h>
 #include "win32hle.h"
 
 #define HEAP_ZERO_MEMORY            0x00000008u

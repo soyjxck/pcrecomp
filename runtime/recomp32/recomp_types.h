@@ -1069,7 +1069,18 @@ static inline void CPUID_impl(uint32_t eax_val, uint32_t ebx_val, uint32_t ecx_v
     if (eax_val == 0x80000001u) g_edx &= g_cpuid_edx_ext;
     (void)ebx_val; (void)edx_val;
 #else
-    (void)eax_val; (void)ebx_val; (void)ecx_val; (void)edx_val;
+    /* No CPUID to ask (an arm64 host), or no intrinsic for it: the answers of
+     * a plain SSE2 CPU, which is what the lift covers. Leaving the registers
+     * as they were handed the guest's C runtime whatever happened to be in
+     * them as its feature bits. */
+    (void)ebx_val; (void)ecx_val; (void)edx_val;
+    switch (eax_val) {
+    case 0:  g_eax = 1; g_ebx = 0x756E6547u; g_edx = 0x49656E69u; g_ecx = 0x6C65746Eu; break;   /* GenuineIntel */
+    case 1:  g_eax = 0x00000F29u; g_ebx = 0x00000800u;
+             g_edx = 0x078BFBFFu & g_cpuid_edx1;       /* x87, TSC, CX8, CMOV, CLFSH, MMX, FXSR, SSE, SSE2 */
+             g_ecx = 0; break;
+    default: g_eax = g_ebx = g_ecx = g_edx = 0; break;
+    }
 #endif
 }
 

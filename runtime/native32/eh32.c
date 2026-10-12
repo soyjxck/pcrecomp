@@ -37,20 +37,44 @@
  * is skipped, not asked: its filter could catch a C++ throw, and its __finally
  * blocks do not run on the way past. Add when a title catches that way.
  */
+/* Built two ways: as part of native32.c on Windows (the flat 32-bit host, a
+ * guest address IS a host address), and on its own for a host that keeps the
+ * guest in a reservation (win32hle on Linux, macOS, arm64): every guest
+ * address goes through ADDR(), which is the identity on the flat host. */
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#endif
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "recomp_types.h"
+
+#ifdef _MSC_VER
+#define EH_THREAD __declspec(thread)
+#else
+#define EH_THREAD __thread
+#endif
+
+/* Whether n bytes of guest memory at va can be read. Off Windows the whole
+ * reservation reads (untouched pages as zeros), so only the null page is out. */
+static int eh_readable(uint32_t va, uint32_t n) {
+#ifdef _WIN32
+    return va >= 0x10000u && !IsBadReadPtr((const void*)(uintptr_t)ADDR(va), n);
+#else
+    (void)n;
+    return va >= 0x10000u;
+#endif
+}
 
 #define EH_MAGIC_VC6   0x19930520u
 #define EH_MAGIC_VC7   0x19930521u
 #define EH_MAGIC_VC8   0x19930522u
 
-static __declspec(thread) recomp_ehframe_t* t_frames;   /* newest first */
+static EH_THREAD recomp_ehframe_t* t_frames;   /* newest first */
 /* The exception a running catch funclet holds, for a bare `throw;`. */
-static __declspec(thread) uint32_t t_cur_obj, t_cur_info;
+static EH_THREAD uint32_t t_cur_obj, t_cur_info;
 
 void recomp_eh_push(recomp_ehframe_t* f) { f->prev = t_frames; t_frames = f; }
 
@@ -62,11 +86,12 @@ void recomp_eh_pop(recomp_ehframe_t* f) {
 
 /* The FuncInfo a C++ frame's handler stub names, or 0 if it is not one. */
 static uint32_t funcinfo(uint32_t handler) {
-    const uint8_t* h = (const uint8_t*)(uintptr_t)handler;
-    if (handler < 0x10000u || IsBadReadPtr(h, 11) || h[0] != 0xB8) return 0;
+    if (!eh_readable(handler, 11)) return 0;
+    const uint8_t* h = (const uint8_t*)(uintptr_t)ADDR(handler);
+    if (h[0] != 0xB8) return 0;
     if (h[5] != 0xE9 && !(h[5] == 0xFF && h[6] == 0x25)) return 0;
-    uint32_t fi = *(const uint32_t*)(h + 1);
-    if (IsBadReadPtr((void*)(uintptr_t)fi, 20)) return 0;
+    uint32_t fi = MEM32(handler + 1);
+    if (!eh_readable(fi, 20)) return 0;
     uint32_t magic = MEM32(fi);
     return magic == EH_MAGIC_VC6 || magic == EH_MAGIC_VC7 || magic == EH_MAGIC_VC8 ? fi : 0;
 }
@@ -110,7 +135,7 @@ static uint32_t catchable(uint32_t info, uint32_t type) {
     for (int i = 0; i < n; i++) {
         uint32_t ct = MEM32(arr + 4 + 4 * i);
         uint32_t td = MEM32(ct + 4);
-        if (td == type || !strcmp((const char*)(uintptr_t)(td + 8), (const char*)(uintptr_t)(type + 8)))
+        if (td == type || !strcmp((const char*)(uintptr_t)ADDR(td + 8), (const char*)(uintptr_t)ADDR(type + 8)))
             return ct;
     }
     return 0;
@@ -124,7 +149,7 @@ static void bind_catch_object(uint32_t handler, uint32_t ct, uint32_t obj, uint3
     uint32_t src = obj + MEM32(ct + 8);                     /* this-displacement (mdisp) */
     uint32_t size = MEM32(ct + 20), copy = MEM32(ct + 24);
     if (adj & 8) MEM32(dst) = src;                          /* by reference */
-    else if (MEM32(ct) & 1 || !copy) memcpy((void*)(uintptr_t)dst, (void*)(uintptr_t)src, size);
+    else if (MEM32(ct) & 1 || !copy) memcpy((void*)(uintptr_t)ADDR(dst), (void*)(uintptr_t)ADDR(src), size);
     else {                                                  /* copy constructor, thiscall */
         uint32_t ecx = g_ecx;
         g_ecx = dst;
@@ -186,6 +211,7 @@ static int dispatch(uint32_t obj, uint32_t info) {
     return 0;
 }
 
+#ifdef _WIN32
 /* ---- throws from native code ------------------------------------------------
  * A native library the guest calls (an import, a COM method) can throw a C++
  * exception for the guest to catch. It is raised on the host's SEH chain; the
@@ -228,6 +254,7 @@ static void foreign_throw(uint32_t obj, uint32_t info, const char* callee) {
 }
 
 typedef void (__stdcall *cxx_throw_t)(void*, void*);
+#endif  /* _WIN32 */
 
 /* _CxxThrowException(object, ThrowInfo), stdcall, in the lifted model. */
 void native32_shim_CxxThrowException(void) {
@@ -235,8 +262,19 @@ void native32_shim_CxxThrowException(void) {
     if (!info) obj = t_cur_obj, info = t_cur_info;          /* `throw;` */
     g_esp += 4;                                             /* the call's return address */
     if (info) dispatch(obj, info);
-    /* Nothing in the guest catches it: the host's crash report does. */
+    /* Nothing in the guest catches it. */
+#ifdef _WIN32
+    /* The host's crash report sees the real throw. */
     static cxx_throw_t real;
     if (!real) real = (cxx_throw_t)GetProcAddress(LoadLibraryA("msvcrt.dll"), "_CxxThrowException");
     real((void*)(uintptr_t)obj, (void*)(uintptr_t)info);
+#else
+    {
+        const char* type = "?";
+        if (info && MEM32(info + 12) && MEM32(MEM32(info + 12)))
+            type = (const char*)(uintptr_t)ADDR(MEM32(MEM32(MEM32(info + 12) + 4) + 4) + 8);
+        fprintf(stderr, "\n[eh32] uncaught guest C++ exception %s, thrown from sub_%08X\n", type, g_cur_func);
+        abort();
+    }
+#endif
 }
