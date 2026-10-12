@@ -926,6 +926,48 @@ void d3d9_gl_present(void) {
     DOING("nothing");
 }
 
+/* A host's own picture (a frame of a movie it is playing itself): `rgba` is
+ * w by h, top row first. It takes the place of the game's frame, as large as
+ * fits with its shape kept, and is presented like one. Before a device
+ * exists there is nowhere to show it. */
+int hle_d3d9_show_picture(const uint8_t *rgba, int w, int h) {
+    static GLuint tex, fbo;
+    static int tw, th;
+    if (!d3d9.open || !gl_enter() || w <= 0 || h <= 0) return -1;
+    if (!tex) {
+        glGenTextures(1, &tex);
+        glGenFramebuffers(1, &fbo);
+    }
+    bind_texture(tex);
+    if (tw != w || th != h) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        bind_fbo(fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+        tw = w, th = h;
+    } else glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    int dw = d3d9.w, dh = d3d9.w * h / w;                     /* as large as fits the back buffer */
+    if (dh > d3d9.h) dh = d3d9.h, dw = d3d9.h * w / h;
+    int x = (d3d9.w - dw) / 2, y = (d3d9.h - dh) / 2;
+    GLuint back = fbo_for(d3d9.back, NULL);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, back);
+    g_cur_fbo = ~0u;
+    glDisable(GL_SCISSOR_TEST);
+    glColorMask(1, 1, 1, 1);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glBlitFramebuffer(0, 0, w, h, x, y, x + dw, y + dh, GL_COLOR_BUFFER_BIT, GL_LINEAR);   /* both have their top row first */
+    d3d9_gl_present();
+    d3d9.frame++;
+    if (hle_d3d9_frame_hook) hle_d3d9_frame_hook(d3d9.frame);
+    return 0;
+}
+
 static uint32_t crc32_of(uint32_t crc, const uint8_t *p, size_t n) {
     static uint32_t tab[256];
     if (!tab[1]) for (uint32_t i = 0; i < 256; i++) { uint32_t c = i; for (int k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320u ^ (c >> 1) : c >> 1; tab[i] = c; }

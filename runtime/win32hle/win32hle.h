@@ -303,6 +303,9 @@ extern const char *hle_d3d9_title;
 extern void      (*hle_d3d9_frame_hook)(unsigned frame);   /* after each Present, counted from 1 */
 void          hle_d3d9_desktop(int w, int h);         /* the display mode the guest is told the desktop has */
 int           hle_d3d9_save_png(const char *path);    /* the back buffer: 0 if written */
+/* A host's own picture (w by h of R, G, B, A, top row first) shown in place of
+ * the game's frame and presented: a movie the host plays itself. 0 if shown. */
+int           hle_d3d9_show_picture(const uint8_t *rgba, int w, int h);
 unsigned long hle_d3d9_draws(void);                   /* draw calls so far */
 extern const char *volatile hle_d3d9_doing;           /* what the drawing half is in the middle of */
 /* The SDL2 display and input for a DirectDraw game (screen.c): installs
