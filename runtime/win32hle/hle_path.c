@@ -27,6 +27,27 @@
 
 static char *g_drive[26];
 
+/* newlib (the Switch) names its devices in front of a path: getcwd and
+ * realpath answer "sdmc:/switch/game", not "/switch/game". Everything here
+ * takes a leading slash for "absolute" and turns the rest into a Windows
+ * path, where that colon would land in the middle. The default device is the
+ * one the working directory is on, so a path with the device taken off means
+ * the same file: these two answer without it. */
+#ifdef __SWITCH__
+static char *no_device(char *p) {
+    char *c = p ? strchr(p, ':') : NULL;
+    if (c && c[1] == '/' && !memchr(p, '/', (size_t)(c - p))) memmove(p, c + 1, strlen(c + 1) + 1);
+    return p;
+}
+static char *hle_getcwd(char *buf, size_t n) { return no_device(getcwd(buf, n)); }
+static char *hle_realpath(const char *path) {
+    char *r = realpath(path, NULL);
+    return r ? no_device(r) : strdup(path);     /* a folder that cannot be resolved is taken as spelled */
+}
+#define getcwd(b, n)   hle_getcwd((b), (n))
+#define realpath(p, r) hle_realpath(p)
+#endif
+
 void hle_set_drive(char letter, const char *host_root) {
     int i = (letter | 0x20) - 'a';
     if (i < 0 || i >= 26) return;
@@ -195,6 +216,11 @@ static int host_path_plain(const char *guest, char *out, size_t n) {
  * drive; otherwise Z: and the whole path. Backslashes. */
 void hle_guest_path(const char *host, char *out, size_t n) {
     char abs[1024];
+#ifdef __SWITCH__
+    char plain[1024];
+    snprintf(plain, sizeof plain, "%s", host);
+    host = no_device(plain);
+#endif
     if (host[0] != '/') {
         char cwd[768];
         if (!getcwd(cwd, sizeof cwd)) cwd[0] = 0;

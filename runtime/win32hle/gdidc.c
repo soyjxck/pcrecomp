@@ -69,6 +69,7 @@ static const char *font_file(const char *face, int bold, int italic) {
     const char *family = "Liberation Sans", *style = bold && italic ? "Bold Italic" : bold ? "Bold" : italic ? "Italic" : "Regular";
     if (!strncasecmp(face, "Times", 5) || !strcasecmp(face, "MS Serif") || !strcasecmp(face, "Georgia")) family = "Liberation Serif";
     else if (!strncasecmp(face, "Courier", 7) || !strcasecmp(face, "Fixedsys") || !strcasecmp(face, "Terminal")) family = "Liberation Mono";
+#ifndef __SWITCH__       /* no processes to ask there: the folders below are all there is */
     char cmd[256];
     snprintf(cmd, sizeof cmd, "fc-match -f '%%{file}' '%s:style=%s' 2>/dev/null", family, style);
     FILE *p = popen(cmd, "r");
@@ -78,6 +79,9 @@ static const char *font_file(const char *face, int bold, int italic) {
         path[n] = 0;
         if (n && access(path, R_OK) == 0) return path;
     }
+#else
+    (void)style;
+#endif
     static const char *const dirs[] = { "/usr/share/fonts/truetype/liberation/", "/usr/share/fonts/truetype/liberation2/",
                                         "/usr/share/fonts/liberation/", "/usr/share/fonts/liberation-sans/",
                                         "/usr/share/fonts/TTF/", "/usr/share/fonts/truetype/dejavu/" };
