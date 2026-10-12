@@ -183,12 +183,91 @@ static GLuint fbo_for(d3d9_surface *color, d3d9_surface *depth) {
 }
 static int drawn_into(const d3d9_surface *s) { return s->kind == D3D9_SURF_LEVEL ? s->tex->gl != 0 : s->gl_tex != 0; }
 
+/* ---- the pointer ------------------------------------------------------------------- *
+ * The window's mouse is the guest's mouse, at the point of the back buffer
+ * the present has put under it. A touch screen is a mouse too (SDL reports a
+ * finger as one), with one difference: a finger does not hover. It lands and
+ * presses at once, and a menu that takes "what the pointer is over" a frame
+ * before it takes the click would miss the press. So a touch moves the pointer
+ * at once, presses two frames later, and lets go no sooner than two frames
+ * after that. */
+#define WM_MOUSEMOVE_   0x0200u
+#define WM_LBUTTONDOWN_ 0x0201u
+#define WM_LBUTTONUP_   0x0202u
+#define WM_RBUTTONDOWN_ 0x0204u
+#define WM_RBUTTONUP_   0x0205u
+#define WM_MBUTTONDOWN_ 0x0207u
+#define WM_MBUTTONUP_   0x0208u
+static struct { uint32_t message; int x, y; unsigned frame; } g_later[8];
+static int g_nlater;
+static unsigned g_touch_pressed;        /* the frame the last touch's press is due */
+
+static void pointer_at(uint32_t message, int x, int y) {       /* a point of the back buffer */
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x >= d3d9.w) x = d3d9.w - 1;
+    if (y >= d3d9.h) y = d3d9.h - 1;
+    hle_client_to_screen(d3d9.window, &x, &y);
+    hle_input_mouse(message, x, y);
+}
+static void pointer_later(uint32_t message, int x, int y, unsigned frame) {
+    if (g_nlater == 8) pointer_at(g_later[0].message, g_later[0].x, g_later[0].y), memmove(g_later, g_later + 1, 7 * sizeof g_later[0]), g_nlater--;
+    g_later[g_nlater].message = message, g_later[g_nlater].x = x, g_later[g_nlater].y = y, g_later[g_nlater].frame = frame;
+    g_nlater++;
+}
+static void pointer_due(void) {
+    while (g_nlater && (int)(d3d9.frame - g_later[0].frame) >= 0) {
+        pointer_at(g_later[0].message, g_later[0].x, g_later[0].y);
+        memmove(g_later, g_later + 1, (size_t)(--g_nlater) * sizeof g_later[0]);
+    }
+}
+void hle_d3d9_touch(int down, int x, int y) {
+    if (!d3d9.open) return;
+    if (down) {
+        pointer_at(WM_MOUSEMOVE_, x, y);
+        g_touch_pressed = d3d9.frame + 2;
+        pointer_later(WM_LBUTTONDOWN_, x, y, g_touch_pressed);
+    } else {
+        unsigned at = d3d9.frame + 1;
+        if ((int)(g_touch_pressed + 2 - at) > 0) at = g_touch_pressed + 2;
+        pointer_later(WM_LBUTTONUP_, x, y, at);
+    }
+}
+/* A point of the window, in the back buffer's pixels: the present's own sums, backwards. */
+static void from_window(int wx, int wy, int *x, int *y) {
+    int lw = 0, lh = 0, ww = 0, wh = 0;
+    SDL_GetWindowSize(g_win, &lw, &lh);
+    SDL_GL_GetDrawableSize(g_win, &ww, &wh);
+    if (lw > 0 && lh > 0) wx = wx * ww / lw, wy = wy * wh / lh;
+    int w = ww, h = d3d9.w ? ww * d3d9.h / d3d9.w : wh;
+    if (h > wh) h = wh, w = d3d9.h ? wh * d3d9.w / d3d9.h : ww;
+    *x = w > 0 ? (wx - (ww - w) / 2) * d3d9.w / w : 0;
+    *y = h > 0 ? (wy - (wh - h) / 2) * d3d9.h / h : 0;
+}
+
 /* ---- the context ------------------------------------------------------------------- */
 static void pump(void) {
     SDL_Event e;
+    int x, y;
     if (!g_win || !pthread_equal(pthread_self(), g_window_thread)) return;     /* events belong to the window's thread */
-    while (SDL_PollEvent(&e))
-        if (e.type == SDL_QUIT) hle_post_message(d3d9.window, 0x0010 /* WM_CLOSE */, 0, 0);
+    while (SDL_PollEvent(&e)) switch (e.type) {
+    case SDL_QUIT:
+        hle_post_message(d3d9.window, 0x0010 /* WM_CLOSE */, 0, 0);
+        break;
+    case SDL_MOUSEMOTION:
+        from_window(e.motion.x, e.motion.y, &x, &y);
+        pointer_at(WM_MOUSEMOVE_, x, y);
+        break;
+    case SDL_MOUSEBUTTONDOWN: case SDL_MOUSEBUTTONUP: {
+        int down = e.type == SDL_MOUSEBUTTONDOWN;
+        from_window(e.button.x, e.button.y, &x, &y);
+        if (e.button.which == SDL_TOUCH_MOUSEID) hle_d3d9_touch(down, x, y);
+        else pointer_at(e.button.button == SDL_BUTTON_RIGHT ? (down ? WM_RBUTTONDOWN_ : WM_RBUTTONUP_)
+                      : e.button.button == SDL_BUTTON_MIDDLE ? (down ? WM_MBUTTONDOWN_ : WM_MBUTTONUP_)
+                      : (down ? WM_LBUTTONDOWN_ : WM_LBUTTONUP_), x, y);
+        break;
+    }
+    }
 }
 #ifdef D3D9_HAVE_EGL_HEADLESS
 static int open_headless(void) {
@@ -905,6 +984,7 @@ void d3d9_gl_draw(const d3d9_draw *d) {
 /* ---- the picture, shown and saved --------------------------------------------------- */
 void d3d9_gl_present(void) {
     if (!gl_enter()) return;
+    pointer_due();
     DOING("presenting");
     if (g_win) {
         int ww, wh;

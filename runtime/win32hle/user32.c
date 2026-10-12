@@ -624,8 +624,20 @@ static uint32_t mk_state(void) {
     return (g_keys[0x01] & 0x80 ? 1u : 0u) | (g_keys[0x02] & 0x80 ? 2u : 0u) | (g_keys[VK_SHIFT] & 0x80 ? 4u : 0u) |
            (g_keys[VK_CONTROL] & 0x80 ? 8u : 0u) | (g_keys[0x04] & 0x80 ? 0x10u : 0u);
 }
+/* How often a real pointer has reported. The guest moving the pointer itself
+ * (SetCursorPos) is not counted: a host that has to tell a player's hand from
+ * the game's own gliding of the pointer compares two readings of this. */
+static unsigned g_pointer_events;
+unsigned hle_input_pointer_events(void) { return g_pointer_events; }
+void hle_client_to_screen(uint32_t hwnd, int *x, int *y) {
+    int ox, oy;
+    if (!W(hwnd)) return;
+    origin(W(hwnd), &ox, &oy);
+    *x += ox, *y += oy;
+}
 void hle_input_mouse(uint32_t message, int sx, int sy) {
     g_cursor_x = sx, g_cursor_y = sy;
+    g_pointer_events++;
     uint32_t vk = message == WM_LBUTTONDOWN || message == WM_LBUTTONUP ? 1 : message == WM_RBUTTONDOWN || message == WM_RBUTTONUP ? 2
                 : message == WM_MBUTTONDOWN || message == WM_MBUTTONUP ? 4 : 0;
     int down = message == WM_LBUTTONDOWN || message == WM_RBUTTONDOWN || message == WM_MBUTTONDOWN;

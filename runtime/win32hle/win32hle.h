@@ -145,6 +145,8 @@ void     hle_set_pump_hook(void (*fn)(void)); /* called when the queue is empty 
  * mode), input as a mouse and keyboard would give it, and what is where. */
 void     hle_set_screen_size(int w, int h);
 void     hle_input_mouse(uint32_t message, int screen_x, int screen_y);   /* WM_MOUSEMOVE, WM_LBUTTONDOWN, ... */
+unsigned hle_input_pointer_events(void);                                  /* how many of those there have been */
+void     hle_client_to_screen(uint32_t hwnd, int *x, int *y);             /* a point of a window's client area */
 void     hle_input_key(int down, uint32_t vk, uint32_t scan);
 void     hle_input_cursor(int screen_x, int screen_y);                    /* GetCursorPos, without a message */
 void     hle_input_key_state(uint32_t vk, int down);                      /* GetKeyState, without a message */
@@ -306,6 +308,11 @@ int           hle_d3d9_save_png(const char *path);    /* the back buffer: 0 if w
 /* A host's own picture (w by h of R, G, B, A, top row first) shown in place of
  * the game's frame and presented: a movie the host plays itself. 0 if shown. */
 int           hle_d3d9_show_picture(const uint8_t *rgba, int w, int h);
+/* A finger on the picture, at a point of the back buffer, or lifted from it:
+ * the pointer goes there and the left button follows two frames later, so a
+ * menu that wants the pointer over a thing before the click has had it there.
+ * A touch screen's events come this way by themselves; a test can call it. */
+void          hle_d3d9_touch(int down, int x, int y);
 unsigned long hle_d3d9_draws(void);                   /* draw calls so far */
 extern const char *volatile hle_d3d9_doing;           /* what the drawing half is in the middle of */
 /* The SDL2 display and input for a DirectDraw game (screen.c): installs
