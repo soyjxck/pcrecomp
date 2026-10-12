@@ -575,66 +575,108 @@ static void k_GetDriveTypeA(void) {
     RET(hle_host_path(path, host, sizeof host) && host[0] ? 3u : 1u, 1);
 }
 
-/* ---- .ini profile: a minimal reader/writer over a flat key=value file ----
- * Enough for a game remembering settings; sections are honoured on read. */
+/* ---- .ini profile ----
+ * The file is read whole into a list of section, key and value, and a write
+ * puts the whole list back: a key that is written again takes the place of
+ * the one that was there, as on Windows. Where a file holds a key twice (an
+ * older version of this code added a line for every write), the later one
+ * counts, and the next write leaves one. Comments and blank lines are not
+ * kept. */
+typedef struct { char *sec, *key, *val; } ini_kv;
 static FILE *ini_open(const char *file, const char *mode) {
     char path[1024];
     if (!file) return NULL;
     hle_host_path(file, path, sizeof path);
     return fopen(path, mode);
 }
-static int ini_find_section(FILE *f, const char *section) {
-    char line[512]; char want[256];
-    snprintf(want, sizeof want, "[%s]", section);
-    rewind(f);
-    while (fgets(line, sizeof line, f))
-        if (line[0] == '[' && !strncasecmp(line, want, strlen(want))) return 1;
-    return 0;
+static void ini_free(ini_kv *kv, int n) {
+    for (int i = 0; i < n; i++) free(kv[i].sec), free(kv[i].key), free(kv[i].val);
+    free(kv);
+}
+static int ini_find(const ini_kv *kv, int n, const char *sec, const char *key) {
+    for (int i = 0; i < n; i++) if (!strcasecmp(kv[i].sec, sec) && !strcasecmp(kv[i].key, key)) return i;
+    return -1;
+}
+static int ini_load(const char *file, ini_kv **out) {
+    FILE *f = ini_open(file, "r");
+    char line[1100], sec[256] = "";
+    ini_kv *kv = NULL;
+    int n = 0, cap = 0;
+    *out = NULL;
+    if (!f) return 0;
+    while (fgets(line, sizeof line, f)) {
+        char *end = line + strcspn(line, "\r\n"), *eq;
+        *end = 0;
+        if (line[0] == '[') {
+            char *close = strchr(line, ']');
+            if (close) *close = 0;
+            snprintf(sec, sizeof sec, "%s", line + 1);
+            continue;
+        }
+        if (line[0] == ';' || !(eq = strchr(line, '=')) || eq == line) continue;
+        *eq = 0;
+        int at = ini_find(kv, n, sec, line);
+        if (at >= 0) { free(kv[at].val); kv[at].val = strdup(eq + 1); continue; }
+        if (n == cap) kv = realloc(kv, (size_t)(cap = cap ? cap * 2 : 128) * sizeof *kv);
+        kv[n].sec = strdup(sec), kv[n].key = strdup(line), kv[n].val = strdup(eq + 1), n++;
+    }
+    fclose(f);
+    *out = kv;
+    return n;
+}
+/* Sections in the order they first appear, each with its keys in theirs. */
+static void ini_save(const char *file, const ini_kv *kv, int n) {
+    FILE *f = ini_open(file, "w");
+    if (!f) return;
+    for (int i = 0; i < n; i++) {
+        int first = 1;
+        for (int k = 0; k < i; k++) if (!strcasecmp(kv[k].sec, kv[i].sec)) { first = 0; break; }
+        if (!first) continue;
+        fprintf(f, "[%s]\r\n", kv[i].sec);
+        for (int k = i; k < n; k++) if (!strcasecmp(kv[k].sec, kv[i].sec)) fprintf(f, "%s=%s\r\n", kv[k].key, kv[k].val);
+    }
+    fclose(f);
 }
 static void k_GetPrivateProfileStringA(void) {           /* (sec,key,def,buf,size,file) */
     const char *sec = ASTR(0), *key = ASTR(1), *def = ASTR(2);
-    char *buf = ASTR(3); uint32_t size = A32(4); const char *file = ASTR(5);
-    const char *val = def ? def : "";
-    char line[512];
-    FILE *f = ini_open(file, "r");
-    if (f && sec && key && ini_find_section(f, sec)) {
-        size_t kl = strlen(key);
-        while (fgets(line, sizeof line, f)) {
-            if (line[0] == '[') break;                   /* next section */
-            if (!strncasecmp(line, key, kl) && line[kl] == '=') {
-                char *v = line + kl + 1, *nl = strpbrk(v, "\r\n"); if (nl) *nl = 0;
-                static char out[512]; strncpy(out, v, sizeof out - 1); val = out; break;
-            }
-        }
-    }
-    if (f) fclose(f);
-    if (buf && size) { strncpy(buf, val, size - 1); buf[size - 1] = 0; }
+    char *buf = ASTR(3); uint32_t size = A32(4);
+    ini_kv *kv;
+    int n = ini_load(ASTR(5), &kv), at = sec && key ? ini_find(kv, n, sec, key) : -1;
+    if (buf && size) { strncpy(buf, at >= 0 ? kv[at].val : def ? def : "", size - 1); buf[size - 1] = 0; }
+    ini_free(kv, n);
     RET(buf ? (uint32_t)strlen(buf) : 0u, 6);
 }
 static void k_GetPrivateProfileIntA(void) {              /* (sec,key,def,file) */
-    char buf[64] = "", def[16];
-    snprintf(def, sizeof def, "%d", (int)A32(2));
-    const char *sec = ASTR(0), *key = ASTR(1), *file = ASTR(3);
-    FILE *f = ini_open(file, "r"); char line[512]; int got = 0;
-    if (f && sec && key && ini_find_section(f, sec)) {
-        size_t kl = strlen(key);
-        while (fgets(line, sizeof line, f)) {
-            if (line[0] == '[') break;
-            if (!strncasecmp(line, key, kl) && line[kl] == '=') { strncpy(buf, line + kl + 1, 63); got = 1; break; }
-        }
-    }
-    if (f) fclose(f);
-    RET((uint32_t)atoi(got ? buf : def), 4);
+    const char *sec = ASTR(0), *key = ASTR(1);
+    ini_kv *kv;
+    int n = ini_load(ASTR(3), &kv), at = sec && key ? ini_find(kv, n, sec, key) : -1;
+    uint32_t v = at >= 0 ? (uint32_t)atoi(kv[at].val) : A32(2);
+    ini_free(kv, n);
+    RET(v, 4);
 }
-/* WritePrivateProfileStringA: append the key under a (possibly new) section;
- * the reader takes the first match. A title that rewrites keys gets the
- * in-place version when it needs it. */
+/* A NULL value takes the key out, a NULL key the whole section. */
 static void k_WritePrivateProfileStringA(void) {         /* (sec,key,val,file) */
     const char *sec = ASTR(0), *key = ASTR(1), *val = ASTR(2), *file = ASTR(3);
-    if (file && sec && key) {
-        FILE *f = ini_open(file, "a");
-        if (f) { fprintf(f, "[%s]\n%s=%s\n", sec, key, val ? val : ""); fclose(f); }
+    ini_kv *kv;
+    int n, at;
+    if (!file || !sec) RET(0, 4);
+    n = ini_load(file, &kv);
+    if (!key || !val) {
+        for (int i = 0; i < n; i++)
+            if (!strcasecmp(kv[i].sec, sec) && (!key || !strcasecmp(kv[i].key, key))) {
+                free(kv[i].sec), free(kv[i].key), free(kv[i].val);
+                memmove(&kv[i], &kv[i + 1], (size_t)(n - i - 1) * sizeof *kv);
+                n--, i--;
+            }
+    } else if ((at = ini_find(kv, n, sec, key)) >= 0) {
+        free(kv[at].val);
+        kv[at].val = strdup(val);
+    } else {
+        kv = realloc(kv, (size_t)(n + 1) * sizeof *kv);
+        kv[n].sec = strdup(sec), kv[n].key = strdup(key), kv[n].val = strdup(val), n++;
     }
+    ini_save(file, kv, n);
+    ini_free(kv, n);
     RET(1, 4);
 }
 
