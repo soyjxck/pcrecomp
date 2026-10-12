@@ -18,10 +18,13 @@ Covered: the scalar and packed float arithmetic, moves, compares (comiss
 and friends set EFLAGS the way sahf does, as a FK_EFLAGS word), shuffles and
 unpacks, the conversions, ldmxcsr/stmxcsr, and the integer SSE2 forms that
 MSVC's code and its CRT's SSE2 math library use (pxor/pand/por/pandn,
-psrldq/pslldq, punpck*qdq, pshufd, paddd/psubd, movd/movq, the lane shifts,
-pcmpeq/pcmpgt, pextrw/pinsrw, pmovmskb, pmaxsw/pminsw). Not the rest of
-packed integer SSE2: anything else with an xmm operand lifts as a counted
-UNIMPLEMENTED line, never as its MMX namesake.
+psrldq/pslldq, the punpck* unpacks, pshufd/pshuflw/pshufhw, padd/psub on every
+lane width, pmullw/pmuludq, movd/movq, the lane shifts, pcmpeq/pcmpgt,
+pextrw/pinsrw, pmovmskb, pmaxsw/pminsw), plus the SSSE3/SSE4.1 forms VC 2017's
+vectoriser and runtime emit behind a CPUID test (palignr, pmulld/pmuldq,
+pmovsx/pmovzx, pinsrb/pinsrd, pextrb/pextrd). Not the rest of packed integer
+SSE: anything else with an xmm operand lifts as a counted UNIMPLEMENTED line,
+never as its MMX namesake.
 Checked against hardware by tools/lift/difftest.py (the sse.* cases).
 """
 
@@ -210,11 +213,60 @@ def lift_sse(L, m, ops, comment):
         idx = f"_k + {n}" if m == 'psrldq' else f"_k - {n}"
         return one(f"{{ xmm_t _s = _xmm[{di}]; for (int _k = 0; _k < 16; _k++) "
                    f"_xmm[{di}].u8[_k] = ({idx} >= 0 && {idx} < 16) ? _s.u8[{idx}] : 0; }}")
-    if m in ('paddd', 'psubd', 'paddq', 'psubq') and di is not None:
-        k, n = ('u32', 4) if m.endswith('d') else ('u64', 2)
+    if m in ('paddb', 'psubb', 'paddw', 'psubw', 'paddd', 'psubd', 'paddq', 'psubq') and di is not None:
+        k, n = {'b': ('u8', 16), 'w': ('u16', 8), 'd': ('u32', 4), 'q': ('u64', 2)}[m[-1]]
         o = '+' if m.startswith('padd') else '-'
         return one(f"{{ xmm_t _s = {X(s)}; for (int _k = 0; _k < {n}; _k++) "
-                   f"_xmm[{di}].{k}[_k] {o}= _s.{k}[_k]; }}")
+                   f"_xmm[{di}].{k}[_k] = ({_CT[k]})(_xmm[{di}].{k}[_k] {o} _s.{k}[_k]); }}")
+    # Multiplies. pmullw/pmulld keep the low half of each product; pmuludq and
+    # pmuldq (SSE4.1) multiply dwords 0 and 2 into the two quadwords. MSVC's
+    # vectoriser emits pmulld/pmuldq behind an __isa_available test, with
+    # pmuludq and the unpacks below as the SSE2 path.
+    if m in ('pmullw', 'pmulld') and di is not None:
+        k, n = ('u16', 8) if m == 'pmullw' else ('u32', 4)
+        return one(f"{{ xmm_t _s = {X(s)}; for (int _k = 0; _k < {n}; _k++) "
+                   f"_xmm[{di}].{k}[_k] = ({_CT[k]})((uint32_t)_xmm[{di}].{k}[_k] * (uint32_t)_s.{k}[_k]); }}")
+    if m in ('pmuludq', 'pmuldq') and di is not None:
+        w = '(uint64_t)' if m == 'pmuludq' else '(int64_t)(int32_t)'
+        return one(f"{{ xmm_t _s = {X(s)}, _d = _xmm[{di}]; for (int _k = 0; _k < 2; _k++) "
+                   f"_xmm[{di}].u64[_k] = (uint64_t)({w}_d.u32[2 * _k] * {w}_s.u32[2 * _k]); }}")
+    # punpck{l,h}{bw,wd,dq}: interleave the low or high half of the lanes,
+    # destination first. (The qdq forms are with unpcklpd above.)
+    if m in ('punpcklbw', 'punpckhbw', 'punpcklwd', 'punpckhwd', 'punpckldq', 'punpckhdq') and di is not None:
+        k, n = {'bw': ('u8', 16), 'wd': ('u16', 8), 'dq': ('u32', 4)}[m[-2:]]
+        base = n // 2 if m[6] == 'h' else 0
+        return one(f"{{ xmm_t _s = {X(s)}, _d = _xmm[{di}]; for (int _k = 0; _k < {n // 2}; _k++) {{ "
+                   f"_xmm[{di}].{k}[2 * _k] = _d.{k}[{base} + _k]; "
+                   f"_xmm[{di}].{k}[2 * _k + 1] = _s.{k}[{base} + _k]; }} }}")
+    # pshuflw/pshufhw shuffle one half's words and copy the other half.
+    if m in ('pshuflw', 'pshufhw') and di is not None:
+        i, base = ops[2].imm, 4 if m == 'pshufhw' else 0
+        return one(f"{{ xmm_t _s = {X(s)}; _xmm[{di}] = _s; "
+                   + ' '.join(f"_xmm[{di}].u16[{base + j}] = _s.u16[{base + ((i >> (2 * j)) & 3)}];"
+                              for j in range(4)) + " }")
+    # palignr (SSSE3): the 32 bytes destination:source shifted right by imm
+    # bytes. The C runtime's memmove uses it behind a CPUID test.
+    if m == 'palignr' and di is not None:
+        n = ops[2].imm & 0xFF
+        return one(f"{{ xmm_t _s = {X(s)}, _d = _xmm[{di}]; for (int _k = 0; _k < 16; _k++) {{ "
+                   f"int _j = _k + {n}; _xmm[{di}].u8[_k] = _j < 16 ? _s.u8[_j] : _j < 32 ? _d.u8[_j - 16] : 0; }} }}")
+    # pmovsx/pmovzx (SSE4.1): widen the low lanes of the source. A memory
+    # source is only as wide as the lanes read, so it is not loaded as 16 bytes.
+    if m[:6] in ('pmovsx', 'pmovzx') and m[6:] in ('bw', 'bd', 'bq', 'wd', 'wq', 'dq') and di is not None:
+        sb = {'b': 8, 'w': 16, 'd': 32}[m[6]]
+        db = {'w': 16, 'd': 32, 'q': 64}[m[7]]
+        n = 128 // db
+        sk, dk = f"u{sb}", f"u{db}"
+        if _xi(s) is not None:
+            src = f"xmm_t _s = _xmm[{_xi(s)}];"
+        else:
+            nbytes = n * sb // 8
+            src = (f"xmm_t _s; _s.u64[0] = _s.u64[1] = 0; "
+                   f"memcpy(&_s, (const void*)ADDR({addr(s)}), {nbytes});")
+        cast = f"(int{sb}_t)" if m[4] == 's' else ''
+        wide = f"(int{db}_t)" if m[4] == 's' else ''
+        return one(f"{{ {src} xmm_t _r; for (int _k = 0; _k < {n}; _k++) "
+                   f"_r.{dk}[_k] = (uint{db}_t){wide}{cast}_s.{sk}[_k]; _xmm[{di}] = _r; }}")
     # Lane shifts. The count is an immediate or the low quadword of an xmm or
     # memory operand, and a count at or past the lane width zeroes the lane
     # (all sign bits for psra*), where C calls the shift undefined.
@@ -244,6 +296,14 @@ def lift_sse(L, m, ops, comment):
         return one(f"{L._fmt_write(d, f'(uint32_t)_xmm[{_xi(s)}].u16[{ops[2].imm & 7}]')};")
     if m == 'pinsrw' and di is not None:
         return one(f"_xmm[{di}].u16[{ops[2].imm & 7}] = (uint16_t)({L._fmt_read(s)});")
+    if m == 'pinsrb' and di is not None:      # SSE4.1, as are pinsrd/pextrb/pextrd
+        return one(f"_xmm[{di}].u8[{ops[2].imm & 15}] = (uint8_t)({L._fmt_read(s)});")
+    if m == 'pinsrd' and di is not None:
+        return one(f"_xmm[{di}].u32[{ops[2].imm & 3}] = (uint32_t)({L._fmt_read(s)});")
+    if m == 'pextrb' and _xi(s) is not None:
+        return one(f"{L._fmt_write(d, f'(uint32_t)_xmm[{_xi(s)}].u8[{ops[2].imm & 15}]')};")
+    if m == 'pextrd' and _xi(s) is not None:
+        return one(f"{L._fmt_write(d, f'_xmm[{_xi(s)}].u32[{ops[2].imm & 3}]')};")
     if m == 'pmovmskb' and _xi(s) is not None:
         return one(f"{{ uint32_t _m = 0; for (int _k = 0; _k < 16; _k++) "
                    f"_m |= (uint32_t)(_xmm[{_xi(s)}].u8[_k] >> 7) << _k; "
@@ -284,6 +344,10 @@ def lift_sse(L, m, ops, comment):
     if m == 'cvtdq2pd':
         return one(f"{{ int32_t _a = (int32_t){lane(s, 0, 'u32')}, _b = (int32_t){lane(s, 1, 'u32')}; "
                    f"_xmm[{di}].f64[0] = _a; _xmm[{di}].f64[1] = _b; }}")
+    if m in ('cvtpd2dq', 'cvttpd2dq'):
+        trunc = 1 if m.startswith('cvtt') else 0
+        return one(f"{{ xmm_t _s = {X(s)}; _xmm[{di}].i32[0] = sse_cvt_i32(_s.f64[0], {trunc}); "
+                   f"_xmm[{di}].i32[1] = sse_cvt_i32(_s.f64[1], {trunc}); _xmm[{di}].u64[1] = 0; }}")
     # Anything else with an xmm operand is counted, never handed back: lift32's
     # MMX forms share these mnemonics (psrlq, pcmpeqd) and would lift the xmm
     # register as "unknown reg", a silent wrong value instead of a counted gap.
