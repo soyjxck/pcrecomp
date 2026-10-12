@@ -118,6 +118,14 @@ void hle_audio_stream_close(int id) {
 }
 
 void (*hle_dsound_tap)(const int16_t *stereo, int frames, int rate);
+
+/* ---- a host's own sound: clips of 16-bit samples mixed in with the guest's
+ * buffers (a voice-over, say). A clip is played once, at its own rate. ---- */
+#define MAX_CLIPS 8
+static struct { int16_t *pcm; uint32_t frames, rate; int channels, state; unsigned id; float gain; double pos; } g_clip[MAX_CLIPS];
+static unsigned g_clip_next = 1;
+enum { CLIP_FREE, CLIP_PLAYING, CLIP_DONE };
+
 static void mix(void *ud, Uint8 *stream, int len) {
     (void)ud;
     int frames = len / 4;
@@ -142,6 +150,22 @@ static void mix(void *ud, Uint8 *stream, int len) {
             b->pos += step;
         }
     }
+    for (int i = 0; i < MAX_CLIPS; i++) {
+        if (g_clip[i].state != CLIP_PLAYING) continue;
+        double step = (double)g_clip[i].rate / OUT_RATE;
+        const int16_t *p = g_clip[i].pcm;
+        int ch = g_clip[i].channels;
+        for (int f = 0; f < frames; f++) {
+            uint32_t at = (uint32_t)g_clip[i].pos;
+            if (at + 1 >= g_clip[i].frames) { g_clip[i].state = CLIP_DONE; break; }
+            float t = (float)(g_clip[i].pos - at);           /* between two samples: a clip is rarely at the output's rate */
+            float l = (p[at * ch] + (p[(at + 1) * ch] - p[at * ch]) * t) / 32768.0f;
+            float r = ch > 1 ? (p[at * ch + 1] + (p[(at + 1) * ch + 1] - p[at * ch + 1]) * t) / 32768.0f : l;
+            acc[2 * f] += l * g_clip[i].gain;
+            acc[2 * f + 1] += r * g_clip[i].gain;
+            g_clip[i].pos += step;
+        }
+    }
     for (int i = 0; i < MAX_STREAMS; i++) {
         if (!g_stream[i].used) continue;
         double step = (double)g_stream[i].rate / OUT_RATE;
@@ -160,6 +184,36 @@ static void mix(void *ud, Uint8 *stream, int len) {
         out[k] = (int16_t)(v > 32767.0f ? 32767 : v < -32768.0f ? -32768 : v);
     }
     if (hle_dsound_tap) hle_dsound_tap(out, frames, OUT_RATE);
+}
+
+static int audio_open(void);
+/* Play `frames` frames of interleaved 16-bit samples. The samples become the
+ * mixer's (malloc'd by the caller, freed here). Returns a handle, 0 if there
+ * is no audio or no free seat. */
+unsigned hle_audio_clip_play(int16_t *pcm, uint32_t frames, int rate, int channels, float gain) {
+    unsigned id = 0;
+    if (!pcm || frames < 2 || rate <= 0 || channels < 1 || !audio_open()) { free(pcm); return 0; }
+    pthread_mutex_lock(&g_mix);
+    for (int i = 0; i < MAX_CLIPS; i++) {
+        if (g_clip[i].state == CLIP_DONE) free(g_clip[i].pcm), g_clip[i].pcm = NULL, g_clip[i].state = CLIP_FREE;
+        if (!id && g_clip[i].state == CLIP_FREE) {
+            g_clip[i].pcm = pcm, g_clip[i].frames = frames, g_clip[i].rate = (uint32_t)rate, g_clip[i].channels = channels;
+            g_clip[i].gain = gain, g_clip[i].pos = 0, g_clip[i].id = id = g_clip_next++, g_clip[i].state = CLIP_PLAYING;
+        }
+    }
+    pthread_mutex_unlock(&g_mix);
+    if (!id) free(pcm);
+    return id;
+}
+void hle_audio_clip_stop(unsigned id) {
+    pthread_mutex_lock(&g_mix);
+    for (int i = 0; id && i < MAX_CLIPS; i++)
+        if (g_clip[i].state != CLIP_FREE && g_clip[i].id == id) free(g_clip[i].pcm), g_clip[i].pcm = NULL, g_clip[i].state = CLIP_FREE;
+    pthread_mutex_unlock(&g_mix);
+}
+int hle_audio_clip_playing(unsigned id) {
+    for (int i = 0; id && i < MAX_CLIPS; i++) if (g_clip[i].id == id && g_clip[i].state == CLIP_PLAYING) return 1;
+    return 0;
 }
 
 static int audio_open(void) {

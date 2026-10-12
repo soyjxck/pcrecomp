@@ -274,6 +274,13 @@ void hle_dd_mode(int *w, int *h, int *bpp);
 int  hle_dd_surface_pixels(uint32_t obj, uint8_t **px, int *w, int *h, int *pitch, int *bpp);   /* 0: not a surface */
 void hle_dsound_set_master(float gain);              /* 0 mutes */
 extern void (*hle_dsound_tap)(const int16_t *stereo, int frames, int rate);   /* what was just mixed, on the audio thread */
+/* A host's own sound in the same mixer: a clip of interleaved 16-bit samples,
+ * played once. The samples (malloc'd) become the mixer's. 0: not played. */
+unsigned hle_audio_clip_play(int16_t *pcm, uint32_t frames, int rate, int channels, float gain);
+void     hle_audio_clip_stop(unsigned clip);
+int      hle_audio_clip_playing(unsigned clip);
+/* A whole Ogg Vorbis file decoded (vorbisfile.c): malloc'd samples, or NULL. */
+int16_t *hle_vorbis_decode_file(const char *host_path, uint32_t *frames, int *rate, int *channels);
 /* A host's own sound (a movie's), mixed with the game's buffers: interleaved
  * s16 pushed at its own rate. */
 int  hle_audio_stream_open(int rate, int channels);   /* an id, or -1 with no audio */

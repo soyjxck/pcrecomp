@@ -122,6 +122,37 @@ static int dec_comments(stream *s, const char **vendor) { stb_vorbis_comment c =
 static const char *dec_comment(stream *s, int i) { return stb_vorbis_get_comment(s->v).comment_list[i]; }
 #endif
 
+/* ---- for the host: a whole Ogg Vorbis file as 16-bit samples ----------------------
+ * (a voice clip to hand the mixer). malloc'd; NULL if it cannot be read. */
+int16_t *hle_vorbis_decode_file(const char *host_path, uint32_t *frames, int *rate, int *channels) {
+    stream s;
+    FILE *f = fopen(host_path, "rb");
+    long size;
+    memset(&s, 0, sizeof s);
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    s.file = size > 0 ? malloc((size_t)size) : NULL;
+    if (!s.file || fread(s.file, 1, (size_t)size, f) != (size_t)size) { fclose(f); free(s.file); return NULL; }
+    fclose(f);
+    s.size = (size_t)size;
+    if (!dec_open(&s)) { free(s.file); return NULL; }
+    size_t cap = (size_t)dec_total(&s) * (size_t)s.channels * 2 + 65536, got = 0;
+    uint8_t *pcm = malloc(cap);
+    for (;;) {
+        if (pcm && cap - got < 16384) { uint8_t *more = realloc(pcm, cap *= 2); if (!more) { free(pcm); pcm = NULL; } else pcm = more; }
+        if (!pcm) break;
+        long n = dec_read(&s, pcm + got, (int)(cap - got > 65536 ? 65536 : cap - got));
+        if (n <= 0) break;
+        got += (size_t)n;
+    }
+    *frames = (uint32_t)(got / 2 / (size_t)s.channels), *rate = s.rate, *channels = s.channels;
+    dec_close(&s);
+    free(s.file);
+    return (int16_t *)pcm;
+}
+
 /* ---- what the game calls ---------------------------------------------------------- */
 static stream *find(uint32_t vf) {
     for (int i = 0; vf && i < MAX_STREAMS; i++) if (g_stream[i].vf == vf) return &g_stream[i];
