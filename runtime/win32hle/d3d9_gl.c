@@ -929,39 +929,55 @@ void d3d9_gl_present(void) {
 /* A host's own picture (a frame of a movie it is playing itself): `rgba` is
  * w by h, top row first. It takes the place of the game's frame, as large as
  * fits with its shape kept, and is presented like one. Before a device
- * exists there is nowhere to show it. */
+ * exists there is nowhere to show it.
+ *
+ * It is drawn the way the guest's own textures are, as a texture on a
+ * rectangle: a copy between framebuffers from a texture that was only ever
+ * filled from memory came out black under one Switch emulator. */
 int hle_d3d9_show_picture(const uint8_t *rgba, int w, int h) {
-    static GLuint tex, fbo;
-    static int tw, th;
+    static GLuint tex, program;
+    static GLint u_rect;
     if (!d3d9.open || !gl_enter() || w <= 0 || h <= 0) return -1;
-    if (!tex) {
+    if (!program) {
+        /* the four corners from the vertex's number: no vertex data at all */
+        GLuint v = compile(GL_VERTEX_SHADER,
+            "#version 300 es\nprecision highp float;\nuniform vec4 u_rect;\nout vec2 v_uv;\nvoid main() {\n"
+            "  v_uv = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1));\n"
+            "  gl_Position = vec4((u_rect.xy + v_uv * u_rect.zw) * 2.0 - 1.0, 0.0, 1.0);\n}\n");
+        GLuint f = compile(GL_FRAGMENT_SHADER,
+            "#version 300 es\nprecision mediump float;\nuniform sampler2D u_tex;\nin vec2 v_uv;\nout vec4 o_color;\n"
+            "void main() { o_color = vec4(texture(u_tex, v_uv).rgb, 1.0); }\n");
+        program = glCreateProgram();
+        glAttachShader(program, v), glAttachShader(program, f);
+        glLinkProgram(program);
+        glDeleteShader(v), glDeleteShader(f);
+        glUseProgram(program);
+        glUniform1i(glGetUniformLocation(program, "u_tex"), 0);
+        u_rect = glGetUniformLocation(program, "u_rect");
         glGenTextures(1, &tex);
-        glGenFramebuffers(1, &fbo);
-    }
-    bind_texture(tex);
-    if (tw != w || th != h) {
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+        bind_texture(tex);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        bind_fbo(fbo);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
-        tw = w, th = h;
-    } else glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    }
+    bind_texture(tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
     int dw = d3d9.w, dh = d3d9.w * h / w;                     /* as large as fits the back buffer */
     if (dh > d3d9.h) dh = d3d9.h, dw = d3d9.h * w / h;
-    int x = (d3d9.w - dw) / 2, y = (d3d9.h - dh) / 2;
-    GLuint back = fbo_for(d3d9.back, NULL);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, back);
-    g_cur_fbo = ~0u;
-    glDisable(GL_SCISSOR_TEST);
+    bind_fbo(fbo_for(d3d9.back, NULL));
+    glViewport(0, 0, d3d9.w, d3d9.h);
+    glDisable(GL_SCISSOR_TEST), glDisable(GL_DEPTH_TEST), glDisable(GL_BLEND), glDisable(GL_CULL_FACE);
     glColorMask(1, 1, 1, 1);
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
-    glBlitFramebuffer(0, 0, w, h, x, y, x + dw, y + dh, GL_COLOR_BUFFER_BIT, GL_LINEAR);   /* both have their top row first */
+    glUseProgram(program), g_cur_prog = program;
+    /* the back buffer's first row is the picture's top, and so is the texture's */
+    glUniform4f(u_rect, (float)((d3d9.w - dw) / 2) / (float)d3d9.w, (float)((d3d9.h - dh) / 2) / (float)d3d9.h,
+                (float)dw / (float)d3d9.w, (float)dh / (float)d3d9.h);
+    enable_arrays(0);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     d3d9_gl_present();
     d3d9.frame++;
     if (hle_d3d9_frame_hook) hle_d3d9_frame_hook(d3d9.frame);
