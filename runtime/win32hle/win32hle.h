@@ -102,6 +102,13 @@ uint32_t hle_resolve_or_stub(const char *name);
 
 /* Human name for a synthetic shim VA (for traces/faults), or NULL. */
 const char *hle_name(uint32_t va);
+/* For a host's watchdog: of each thread that has called a shim, in the order
+ * they first did, the shim last entered, the lifted function it was called
+ * from, how many calls so far, and whether it has yet to return. Read from
+ * another thread: a glimpse, not a count to rely on. */
+#define HLE_THREADS_SEEN 8
+typedef struct { const char *volatile shim; volatile uint32_t from; volatile unsigned long calls; volatile int inside; } hle_thread_seen;
+extern hle_thread_seen hle_threads[HLE_THREADS_SEEN];
 
 /* ---- native -> guest ----
  * Run a lifted function (window proc, dialog proc, thread start, timer) from
@@ -122,6 +129,10 @@ void  hle_block_begin(void);
 void  hle_block_end(void);
 /* Inside a shim: hand the machine to a waiting thread, if any. */
 void  hle_yield(void);
+/* Called on a thread about to give the machine up, for a wait (1) or for
+ * another thread's turn (0): for what a host keeps bound to the thread that
+ * runs the guest, such as a graphics context. */
+extern void (*hle_leave_hook)(int waiting);
 
 /* ---- user32 message queue, host-callable ----
  * So the optional SDL present/input layer can inject translated events, and a
@@ -209,6 +220,8 @@ uint32_t hle_thread_id(void);                      /* GetCurrentThreadId's answe
 uint32_t hle_thread_new_id(void);                  /* an id for a thread about to start... */
 void     hle_thread_adopt_id(uint32_t id);         /* ...which that thread takes as its own */
 uint32_t hle_ticks_ms(void);                       /* GetTickCount */
+struct timespec;
+void     hle_clock(struct timespec *ts);           /* the clock the guest's timers read: counted from the process's start */
 /* A polling guest (kernel32.c): a shim the game spins on (PeekMessage with
  * nothing there, the clock while a frame is not yet due, Sleep(0)) calls
  * this; after a burst of such calls inside a millisecond the host sleeps a
@@ -269,6 +282,20 @@ void hle_audio_stream_gain(int id, float gain);
 void hle_audio_stream_close(int id);
 int  hle_file_fd(uint32_t handle);                    /* a file HANDLE's descriptor, or -1 */
 extern const win32hle_shim win32hle_bink[];           /* binkw32 on ffmpeg (bink.c; stubs without HLE_WITH_FFMPEG) */
+/* Direct3D 9 on OpenGL ES 3 (d3d9.c, d3d9_gl.c) and the D3DX it is used with
+ * (d3dx9.c, d3d9_vs.c): empty tables without HLE_WITH_D3D9. The device opens
+ * its own SDL window, or with hle_d3d9_headless set draws with no window. */
+extern const win32hle_shim win32hle_d3d9[];           /* Direct3DCreate9 */
+extern const win32hle_shim win32hle_d3dx9[];          /* d3dx9_NN: maths, textures from files, the shader assembler */
+extern int         hle_d3d9_headless;
+extern int         hle_d3d9_log;                      /* say what is drawn into, through which viewport, and what is read back */
+extern int         hle_d3d9_vsync;                    /* wait for the display at each Present */
+extern const char *hle_d3d9_title;
+extern void      (*hle_d3d9_frame_hook)(unsigned frame);   /* after each Present, counted from 1 */
+void          hle_d3d9_desktop(int w, int h);         /* the display mode the guest is told the desktop has */
+int           hle_d3d9_save_png(const char *path);    /* the back buffer: 0 if written */
+unsigned long hle_d3d9_draws(void);                   /* draw calls so far */
+extern const char *volatile hle_d3d9_doing;           /* what the drawing half is in the middle of */
 /* The SDL2 display and input for a DirectDraw game (screen.c): installs
  * itself as the pump hook. headless: no window (a script drives input). */
 int  hle_screen_open(const char *title, int fullscreen, int headless);

@@ -127,8 +127,10 @@ void mach_enter(void) {
         regs_load(&g_ms.r);
     }
 }
+void (*hle_leave_hook)(int waiting);
 void mach_leave(void) {
     if (--g_ms.depth == 0) {
+        if (hle_leave_hook) hle_leave_hook(1);      /* a thread that has finished is not coming back for what it holds */
         regs_save(&g_ms.r);
         pthread_mutex_unlock(&g_mach);
     }
@@ -138,12 +140,14 @@ void mach_leave(void) {
  * section). The registers go with it; nothing between begin and end may touch
  * the register file or guest-shared host state. */
 static __thread unsigned g_block_gen;
-void hle_block_begin(void) {
+static void block_begin(int waiting) {
     if (!g_ms.depth) return;
+    if (hle_leave_hook) hle_leave_hook(waiting);
     regs_save(&g_ms.r);
     g_block_gen = g_owner_gen;
     pthread_mutex_unlock(&g_mach);
 }
+void hle_block_begin(void) { block_begin(1); }
 /* The mutex is not fair: a thread that gives the machine up for a moment
  * (a wait with no timeout, polled in a loop) took it straight back, and a
  * timer callback waiting for the machine while holding a game mutex never
@@ -161,7 +165,7 @@ void hle_block_end(void) {
 void hle_yield(void) {
     if (!g_waiters || !g_ms.depth) return;
     unsigned gen = g_owner_gen;
-    hle_block_begin();
+    block_begin(0);
     for (int spins = 0; g_waiters && g_owner_gen == gen && spins < 1000; spins++) sched_yield();
     hle_block_end();
 }
@@ -217,10 +221,27 @@ static uint32_t g_last_import_va;
  * entered through shim_entry: the lookup and the call are back to back on the
  * thread that holds the machine, so the index passes through a global. */
 static volatile uint32_t g_pending_shim;
+hle_thread_seen hle_threads[HLE_THREADS_SEEN];
 static void shim_entry(void) {
     uint32_t i = g_pending_shim;
+    static __thread int seat = -1;
+    static int seats;
+    if (seat < 0) seat = __sync_fetch_and_add(&seats, 1);
+    if (seat < HLE_THREADS_SEEN) {
+        hle_thread_seen *t = &hle_threads[seat];
+        t->shim = g_shim[i].name, t->from = g_cur_func, t->calls++, t->inside = 1;
+    }
+    /* HLE_SHIMTRACE=prefix: every call of a shim whose name starts so, with
+     * its first four argument words (HLE_SHIMTRACE= alone: every shim). */
+    static const char *trace;
+    static int tracing = -1;
+    if (tracing < 0) trace = getenv("HLE_SHIMTRACE"), tracing = trace != NULL;
+    if (tracing && !strncmp(g_shim[i].name, trace, strlen(trace)))
+        fprintf(stderr, "[shim] thread %04X: %s(%08X, %08X, %08X, %08X, ...) under sub_%08X\n",
+                (unsigned)((uintptr_t)pthread_self() >> 4) & 0xFFFFu, g_shim[i].name, A32(0), A32(1), A32(2), A32(3), g_cur_func);
     if (g_waiters) hle_yield();
     g_shim[i].fn();
+    if (seat < HLE_THREADS_SEEN) hle_threads[seat].inside = 0;
 }
 recomp_func_t recomp_lookup_import(uint32_t va) {
     if (va < SHIM_BASE || va >= SHIM_BASE + SHIM_STEP * (uint32_t)g_shim_n) return NULL;

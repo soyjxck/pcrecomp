@@ -239,9 +239,24 @@ void hle_poll(int kind) {
     hle_block_end();
 }
 
-/* --- time --- */
+/* --- time ---
+ * What GetTickCount, timeGetTime and the performance counter are read from:
+ * the monotonic clock, counted from a minute before this process first asked.
+ * Windows counts them from when it was started, and games lean on that: one
+ * takes its first reading as a time gone by and counts it off a millisecond
+ * at a time. Where the C library's monotonic clock is the date (the Switch's
+ * is), that was fifty years of milliseconds. */
+void hle_clock(struct timespec *ts) {
+    static struct timespec base;
+    static int based;
+    clock_gettime(CLOCK_MONOTONIC, ts);
+    if (!based) base = *ts, based = 1;
+    ts->tv_sec -= base.tv_sec - 60;
+    ts->tv_nsec -= base.tv_nsec;
+    if (ts->tv_nsec < 0) ts->tv_nsec += 1000000000L, ts->tv_sec--;
+}
 static uint32_t ticks_ms(void) {
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    struct timespec ts; hle_clock(&ts);
     return (uint32_t)((uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u);
 }
 uint32_t hle_ticks_ms(void) { return ticks_ms(); }
@@ -249,7 +264,7 @@ static void k_GetTickCount(void) { hle_poll(HLE_POLL_TIME); RET(ticks_ms(), 0); 
 static void k_QueryPerformanceFrequency(void) { if (A32(0)) MEM32(A32(0)) = 1000000u, MEM32(A32(0) + 4) = 0; RET(1, 1); }
 static void k_QueryPerformanceCounter(void) {
     hle_poll(HLE_POLL_TIME);
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    struct timespec ts; hle_clock(&ts);
     uint64_t us = (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
     if (A32(0)) MEM32(A32(0)) = (uint32_t)us, MEM32(A32(0) + 4) = (uint32_t)(us >> 32);
     RET(1, 1);
