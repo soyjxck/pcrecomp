@@ -98,9 +98,32 @@ int native32_set_native(uint32_t base);
  * lifted entries (the rest are skipped). */
 int native32_lift_in_native(const uint32_t* vas, int n);
 
+/* Native code the bridge may call WITHOUT giving the machine up: a range of
+ * addresses (a whole DLL), one address, or the imports whose name matches
+ * (a trailing '*' matches any ending; call after native32_bind; returns how
+ * many matched).
+ *
+ * The bridge releases the machine lock around a native call so that other
+ * guest threads can run lifted code meanwhile, and that release and claim are
+ * a good part of what a call costs. A callee the host vouches for skips them.
+ * The condition: it must not WAIT for something that only another guest
+ * thread can do (a guest's lock, an event a guest thread sets), since that
+ * thread could then never get the machine. Short work is what this is for:
+ * Direct3D state and draw calls, vector maths, the heap, the clock. Calling
+ * back into the guest on the same thread is fine either way. */
+void native32_fast_range(uint32_t lo, uint32_t hi);
+void native32_fast_target(uint32_t va);
+int  native32_fast_import(const char* name);
+
 /* Diagnostics: set before running. */
 extern int native32_trace_native;     /* one line per native call */
 extern int native32_trace_callbacks;  /* one line per Windows -> guest call */
+extern int native32_count_natives;    /* count calls per native target (native32_dump_counts) */
+extern unsigned native32_slow_ms;     /* report a native call that takes at least this long; 0 = off */
+
+/* The most-called native targets, by name or module+offset, with whether the
+ * bridge kept the machine for them. */
+void native32_dump_counts(int n);
 
 /* Guest address ranges known to the runtime (for fault reports). */
 int native32_in_guest(uint32_t va);

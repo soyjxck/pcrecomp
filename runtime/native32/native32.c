@@ -32,7 +32,8 @@ uint32_t  g_cur_func;
 uint32_t  g_icall_trace[ICALL_TRACE_SIZE], g_icall_from[ICALL_TRACE_SIZE];
 uint32_t  g_icall_trace_idx, g_icall_count;
 
-int native32_trace_native, native32_trace_callbacks;
+int native32_trace_native, native32_trace_callbacks, native32_count_natives;
+unsigned native32_slow_ms;
 
 typedef struct {
     uint32_t eax, ecx, edx, esp, ebx, esi, edi, ebp, fs, cur;
@@ -65,7 +66,6 @@ static void regs_load(const regs_t* r) {
 /* ------------------------------------------------------------- machine lock */
 
 static CRITICAL_SECTION g_mach;
-static DWORD g_mach_tls = TLS_OUT_OF_INDEXES;
 
 /* Argument slots copied per call. Reading past a callee's real arguments is
  * harmless while those words are mapped (mach_enter leaves room); CreateFontA
@@ -90,11 +90,27 @@ static uint32_t make_tib(uint32_t lo, uint32_t hi) {
 
 typedef struct { regs_t r; int depth; } mstate;
 
+/* This thread's state, and the thread whose registers are in the globals now.
+ *
+ * A thread gives the lock up around every native call, and a Direct3D game
+ * makes tens of thousands of those a frame (Trails in the Sky FC: about
+ * 20,000), nearly all from one thread with nobody waiting. Saving the whole
+ * register file at each release and loading it back at each claim cost more
+ * than the game's own code did. So the registers stay in the globals when the
+ * lock is released, and move only when a DIFFERENT thread claims the machine:
+ * it puts the last owner's away and loads its own. The same thread claiming
+ * again finds them where it left them. g_owner is only touched under g_mach.
+ *
+ * Static TLS rather than TlsGetValue, which is a call each time and resets
+ * the thread's last error as a side effect. */
+static __declspec(thread) mstate* t_mach;
+static mstate* g_owner;
+
 /* Nests: a callback that arrives while this thread is inside a native call
- * claims again, and only the outermost claim loads the saved state. */
+ * claims again, and only the outermost claim can find the registers gone. */
 void mach_enter(void) {
     EnterCriticalSection(&g_mach);
-    mstate* m = (mstate*)TlsGetValue(g_mach_tls);
+    mstate* m = t_mach;
     if (!m) {
         /* Stack left for a fault handler after an overflow: without it the
          * report itself overflows and the process just vanishes. */
@@ -112,14 +128,17 @@ void mach_enter(void) {
         m->r.fs = make_tib(lo, lo + GUEST_STACK);
         m->r.fpu_cw = 0x027F;
         m->r.mxcsr = 0x1F80;              /* exceptions masked, round to nearest */
-        TlsSetValue(g_mach_tls, m);
+        t_mach = m;
     }
-    if (m->depth++ == 0) regs_load(&m->r);
+    if (m->depth++ == 0 && g_owner != m) {
+        if (g_owner) regs_save(&g_owner->r);
+        regs_load(&m->r);
+        g_owner = m;
+    }
 }
 
 void mach_leave(void) {
-    mstate* m = (mstate*)TlsGetValue(g_mach_tls);
-    if (--m->depth == 0) regs_save(&m->r);
+    t_mach->depth--;
     LeaveCriticalSection(&g_mach);
 }
 
@@ -127,7 +146,7 @@ void mach_leave(void) {
  * Only the outermost claim can give it up; inside a callback the lock is
  * still held further out, and the loop simply runs on. */
 static void native32_yield(void) {
-    mstate* m = (mstate*)TlsGetValue(g_mach_tls);
+    mstate* m = t_mach;
     if (!m || m->depth != 1) return;
     mach_leave();
     SwitchToThread();
@@ -139,8 +158,10 @@ static void native32_yield(void) {
 #define MAX_MODULES 32
 static struct { uint32_t base, span; int native; char name[MAX_PATH]; } g_mods[MAX_MODULES];
 static int g_mod_n;
+static int g_any_native;              /* some module runs its original code (native32_set_native) */
 
 static recomp_func_t dispatch_find(uint32_t va);
+static void dispatch_flatten(void);
 
 /* Functions inside a native module that still run lifted
  * (native32_lift_in_native), sorted for bsearch. */
@@ -230,6 +251,7 @@ int native32_set_native(uint32_t base) {
                                PAGE_EXECUTE_READWRITE, &old);
         }
         g_mods[i].native = 1;
+        g_any_native = 1;
         return 1;
     }
     return 0;
@@ -358,6 +380,23 @@ const char* native32_name(uint32_t va) {
     return NULL;
 }
 
+/* The name for the fault report and the profiler, set at every native call:
+ * through a small cache, since most native calls are COM methods, which have
+ * no name, and finding that out walks the whole list. Called with the machine
+ * lock held. Never NULL. */
+#define NAME_CACHE 1024
+static struct { uint32_t va; const char* name; } g_name_cache[NAME_CACHE];
+
+static const char* import_name(uint32_t va) {
+    uint32_t k = (va ^ (va >> 10)) & (NAME_CACHE - 1);
+    if (g_name_cache[k].va != va || !g_name_cache[k].name) {
+        const char* n = native32_name(va);
+        g_name_cache[k].va = va;
+        g_name_cache[k].name = n ? n : "(native)";
+    }
+    return g_name_cache[k].name;
+}
+
 static void add_name(uint32_t va, const char* dll, const char* fn) {
     if (g_name_n < MAX_NAMES && !native32_name(va)) {
         _snprintf(g_names[g_name_n].name, sizeof g_names[0].name - 1, "%s!%s", dll, fn);
@@ -380,10 +419,113 @@ static int g_nshims;
 static int foreign_throw_filter(EXCEPTION_POINTERS* ep, uint32_t* obj, uint32_t* info);
 static void foreign_throw(uint32_t obj, uint32_t info, const char* callee);
 
+/* ---- fast natives: callees the bridge keeps the machine for (native32.h) ---- */
+#define FAST_RANGES 8
+#define FAST_SET 2048                 /* open addressing; 0 = empty */
+static struct { uint32_t lo, span; } g_fast_range[FAST_RANGES];
+static int g_fast_ranges;
+static uint32_t g_fast_set[FAST_SET];
+static int g_fast_n;
+
+void native32_fast_range(uint32_t lo, uint32_t hi) {
+    if (g_fast_ranges < FAST_RANGES && hi > lo) {
+        g_fast_range[g_fast_ranges].lo = lo;
+        g_fast_range[g_fast_ranges++].span = hi - lo;
+    }
+}
+
+void native32_fast_target(uint32_t va) {
+    if (!va || g_fast_n >= FAST_SET / 2) return;
+    uint32_t k = (va ^ (va >> 11)) & (FAST_SET - 1);
+    while (g_fast_set[k] && g_fast_set[k] != va) k = (k + 1) & (FAST_SET - 1);
+    if (!g_fast_set[k]) { g_fast_set[k] = va; g_fast_n++; }
+}
+
+int native32_fast_import(const char* name) {
+    size_t n = strlen(name);
+    int star = n && name[n - 1] == '*', hits = 0;
+    if (star) n--;
+    for (int i = 0; i < g_name_n; i++) {
+        const char* fn = strchr(g_names[i].name, '!');
+        if (!fn) continue;
+        fn++;
+        if (star ? !strncmp(fn, name, n) : !strcmp(fn, name)) {
+            native32_fast_target(g_names[i].va);
+            hits++;
+        }
+    }
+    return hits;
+}
+
+static int fast_native(uint32_t va) {
+    for (int i = 0; i < g_fast_ranges; i++)
+        if (va - g_fast_range[i].lo < g_fast_range[i].span) return 1;
+    if (g_fast_n) {
+        uint32_t k = (va ^ (va >> 11)) & (FAST_SET - 1);
+        while (g_fast_set[k]) {
+            if (g_fast_set[k] == va) return 1;
+            k = (k + 1) & (FAST_SET - 1);
+        }
+    }
+    return 0;
+}
+
+/* ---- call counts (native32_count_natives) ---- */
+#define COUNT_SLOTS 16384
+static struct { uint32_t va, n; } g_counts[COUNT_SLOTS];
+
+static void count_native(uint32_t va) {
+    uint32_t k = (va ^ (va >> 11)) & (COUNT_SLOTS - 1);
+    for (int tries = 0; tries < COUNT_SLOTS; tries++, k = (k + 1) & (COUNT_SLOTS - 1)) {
+        if (g_counts[k].va == va) { g_counts[k].n++; return; }
+        if (!g_counts[k].va) { g_counts[k].va = va; g_counts[k].n = 1; return; }
+    }
+}
+
+static int cmp_count(const void* a, const void* b) {
+    uint32_t x = ((const uint32_t*)a)[1], y = ((const uint32_t*)b)[1];
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
+void native32_dump_counts(int n) {
+    uint64_t total = 0, kept = 0;
+    qsort(g_counts, COUNT_SLOTS, sizeof g_counts[0], cmp_count);
+    for (int i = 0; i < COUNT_SLOTS && g_counts[i].n; i++) {
+        total += g_counts[i].n;
+        if (fast_native(g_counts[i].va)) kept += g_counts[i].n;
+    }
+    fprintf(stderr, "native calls: %llu, of which %llu (%.1f%%) kept the machine\n", total, kept,
+            total ? 100.0 * kept / total : 0.0);
+    for (int i = 0; i < n && i < COUNT_SLOTS && g_counts[i].n; i++) {
+        uint32_t va = g_counts[i].va;
+        const char* nm = native32_name(va);
+        char where[MAX_PATH + 16] = "";
+        if (!nm) {
+            HMODULE m = NULL;
+            char path[MAX_PATH] = "";
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   (LPCSTR)(uintptr_t)va, &m) && GetModuleFileNameA(m, path, sizeof path)) {
+                const char* base = strrchr(path, '\\');
+                _snprintf(where, sizeof where - 1, "%s+0x%X", base ? base + 1 : path, va - (uint32_t)(uintptr_t)m);
+            } else {
+                _snprintf(where, sizeof where - 1, "0x%08X", va);
+            }
+            nm = where;
+        }
+        fprintf(stderr, "  %10u  %5.2f%%  %s  %s\n", g_counts[i].n, 100.0 * g_counts[i].n / total,
+                fast_native(va) ? "fast" : "    ", nm);
+    }
+}
+
+/* The thread's last error, where GetLastError keeps it (TEB+0x34 on x86): the
+ * bridge reads and writes it four times a call. */
+#define TEB_LAST_ERROR()       __readfsdword(0x34)
+#define TEB_LAST_ERROR_SET(v)  __writefsdword(0x34, (v))
+
 static void native_bridge(void) {
     /* The guest's last error, as the previous native call left it: the trace
-     * below and mach_leave's TlsGetValue would reset it before this call. */
-    DWORD guest_error = GetLastError();
+     * below would reset it before this call. */
+    DWORD guest_error = TEB_LAST_ERROR();
     uint32_t fn = g_native_target;
     uint32_t* src = (uint32_t*)(uintptr_t)(g_esp + 4);   /* past the dummy ret */
     uint32_t this_ecx = g_ecx, r_eax, r_edx, purge;
@@ -407,10 +549,13 @@ static void native_bridge(void) {
                 fprintf(stderr, " a%d=\"%.*s\"", k, (int)len, p);
         }
     }
-    g_cur_import = native32_name(fn);
-    if (!g_cur_import) g_cur_import = "(native)";
-    mach_leave();
-    SetLastError(guest_error);
+    g_cur_import = import_name(fn);
+    /* A callee the host vouched for keeps the machine: no release, no claim. */
+    int fast = fast_native(fn);
+    if (native32_count_natives) count_native(fn);
+    DWORD t_call = native32_slow_ms ? GetTickCount() : 0;
+    if (!fast) mach_leave();
+    TEB_LAST_ERROR_SET(guest_error);
     /* The locals are reached through whatever base register the compiler
      * chose, and the asm must leave it alone. MSVC uses ebp; clang-cl uses
      * esi (its x86 base pointer, for a frame it realigns), so the old
@@ -467,7 +612,6 @@ static void native_bridge(void) {
         mov  r_eax, eax
         mov  r_edx, edx
         mov  purge, ecx
-        fxam                     ; C3..C0 classify st(0)
         fnstsw ax
         mov  sw1, ax             ; x87 TOP after
     }
@@ -479,34 +623,77 @@ static void native_bridge(void) {
         uint32_t anchor = __readfsdword(0x14);
         __writefsdword(0x14, *(const uint32_t*)(uintptr_t)(anchor + BRIDGE_SLOTS * 4));
         const char* callee = g_cur_import;
-        mach_enter();                           /* the registers as the guest had them at the call */
+        if (!fast) mach_enter();                /* the registers as the guest had them at the call */
         g_cur_import = saved_import;
         foreign_throw(thrown_obj, thrown_info, callee);   /* does not return */
     }
     /* A float result comes back in st(0): TOP moved down by exactly one and
      * st(0) is not empty. A native fninit/_fpreset also moves TOP; without the
      * fxam check that read as a returned float and pushed junk onto the lifted
-     * stack (gunman: every later frame rendered NaNs). */
-    int st_ret = (((sw0 >> 11) - (sw1 >> 11)) & 7) == 1 && (sw1 & 0x4100) != 0x4100;
+     * stack (gunman: every later frame rendered NaNs).
+     *
+     * fxam only when TOP did move, which is rare. Run after every call it was
+     * the most expensive instruction in the program: an empty st(0) still
+     * holds whatever bits were left there, after MMX code that is a NaN
+     * pattern, and classifying one takes a microcode assist. A tenth of the
+     * main thread's time went to it (Trails in the Sky FC, 20,000 native
+     * calls a frame). */
+    int st_ret = (((sw0 >> 11) - (sw1 >> 11)) & 7) == 1;
+    if (st_ret) {
+        __asm {
+            fxam                 ; C3..C0 classify st(0)
+            fnstsw ax
+            mov  sw1, ax
+        }
+        st_ret = (sw1 & 0x4100) != 0x4100;
+    }
     if (st_ret) __asm fstp r_st
-    /* The callee's last error belongs to the guest, but mach_enter's
-     * TlsGetValue resets it to 0 (TlsGetValue always does), and so does
-     * stdio. A guest that loops on FindNextFileA until GetLastError() says
+    /* The callee's last error belongs to the guest, but anything the bridge
+     * calls from here on can reset it (stdio does, and so did the TlsGetValue
+     * mach_enter once used). A guest that loops on FindNextFileA until GetLastError() says
      * ERROR_NO_MORE_FILES then never stopped (KotOR's resource scan): the
      * value has to survive both ways across the bridge, into GetLastError
      * itself and back out of FindNextFileA. */
-    DWORD last_error = GetLastError();
-    mach_enter();
+    DWORD last_error = TEB_LAST_ERROR();
+    if (!fast) mach_enter();
+    if (native32_slow_ms) {
+        DWORD took = GetTickCount() - t_call;
+        if (took >= native32_slow_ms)
+            fprintf(stderr, "[slow] %s @%08X took %lu ms (called from sub_%08X)\n", g_cur_import, fn, took, g_cur_func);
+    }
     if (st_ret) fp_push_impl(g_st, &g_fp_top, r_st);
     g_cur_import = saved_import;
     g_eax = r_eax;
     g_edx = r_edx;
     g_esp += 4 + purge;
     if (native32_trace_native) fprintf(stderr, " -> %08X\n", r_eax);
-    SetLastError(last_error);
+    TEB_LAST_ERROR_SET(last_error);
+}
+
+/* The dispatch table laid out flat over the lifted code's address range, one
+ * slot per byte: an indirect call is then one load instead of a binary search
+ * of every function (thirteen probes for 7,000). Built once; skipped when the
+ * modules lie too far apart for one table, and the search below is used. */
+#define FLAT_MAX_SPAN (16u << 20)
+static recomp_func_t* g_flat;
+static uint32_t g_flat_lo, g_flat_span;
+
+static void dispatch_flatten(void) {
+    if (!recomp_dispatch_count) return;
+    uint32_t lo = recomp_dispatch_table[0].address;
+    uint32_t span = recomp_dispatch_table[recomp_dispatch_count - 1].address - lo + 1;
+    if (span > FLAT_MAX_SPAN) return;
+    recomp_func_t* t = (recomp_func_t*)VirtualAlloc(NULL, span * sizeof *t, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!t) return;
+    for (uint32_t i = 0; i < recomp_dispatch_count; i++)
+        t[recomp_dispatch_table[i].address - lo] = recomp_dispatch_table[i].func;
+    g_flat_lo = lo;
+    g_flat_span = span;
+    g_flat = t;
 }
 
 static recomp_func_t dispatch_find(uint32_t va) {
+    if (g_flat) return va - g_flat_lo < g_flat_span ? g_flat[va - g_flat_lo] : NULL;
     uint32_t lo = 0, hi = recomp_dispatch_count;
     while (lo < hi) {
         uint32_t mid = lo + (hi - lo) / 2, m = recomp_dispatch_table[mid].address;
@@ -517,17 +704,16 @@ static recomp_func_t dispatch_find(uint32_t va) {
 }
 
 recomp_func_t recomp_lookup(uint32_t va) {
-    if (native_module_at(va)) return NULL;    /* its original code runs: recomp_lookup_import */
+    if (g_any_native && native_module_at(va)) return NULL;    /* its original code runs: recomp_lookup_import */
     return dispatch_find(va);
 }
 
 /* Anything that is neither a shim nor inside a guest module is native: an
  * import, a GetProcAddress result, a COM method. */
 recomp_func_t recomp_lookup_import(uint32_t va) {
-    if (IS_SHIM_VA(va)) {
-        for (int i = 0; i < g_nshims; i++)
-            if (g_shims[i].va == va) return g_shims[i].fn;
-        return NULL;
+    if (IS_SHIM_VA(va)) {                     /* bind gave shim i the VA page + 16 * i */
+        uint32_t i = (va - g_shim_page) >> 4;
+        return i < (uint32_t)g_nshims && g_shims[i].va == va ? g_shims[i].fn : NULL;
     }
     if (va < 0x10000u) return NULL;
     if (native32_in_guest(va) && !native_module_at(va) && !data_section_code(va)) return NULL;
@@ -579,8 +765,29 @@ X87CRT(CIacos) X87CRT(CIatan) X87CRT(CIexp) X87CRT(CIlog) X87CRT(CIlog10) X87CRT
 X87CRT(CIcosh) X87CRT(CItanh) X87CRT(CIpow) X87CRT(CIfmod) X87CRT(CIatan2)
 X87CRT(controlfp) X87CRT(control87)
 
+/* EnterCriticalSection: the guest's C runtime takes its heap and stdio locks
+ * constantly, nearly always uncontended. Taking a free lock needs no hand-over
+ * of the machine; only a lock another thread holds does, since that thread
+ * may need the machine to get to its LeaveCriticalSection. */
+static void shim_EnterCriticalSection(void) {
+    CRITICAL_SECTION* cs = (CRITICAL_SECTION*)(uintptr_t)MEM32(g_esp + 4);
+    if (!TryEnterCriticalSection(cs)) {
+        mach_leave();
+        EnterCriticalSection(cs);
+        mach_enter();
+    }
+    g_esp += 4 + 1 * 4;
+}
+
+static void shim_LeaveCriticalSection(void) {
+    LeaveCriticalSection((CRITICAL_SECTION*)(uintptr_t)MEM32(g_esp + 4));
+    g_esp += 4 + 1 * 4;
+}
+
 static native32_shim_t g_builtin[] = {
     { "CreateThread", shim_CreateThread },
+    { "EnterCriticalSection", shim_EnterCriticalSection },
+    { "LeaveCriticalSection", shim_LeaveCriticalSection },
     { "RaiseException", shim_RaiseException },
     { "_CxxThrowException", native32_shim_CxxThrowException },
     { "_ftol", native32_shim_ftol },
@@ -746,7 +953,7 @@ void native32_init(void) {
     SetProcessDEPPolicy(PROCESS_DEP_ENABLE);
     InitializeCriticalSection(&g_mach);
     recomp_yield_hook = native32_yield;
-    g_mach_tls = TlsAlloc();
+    dispatch_flatten();
     g_shim_page = (uint32_t)(uintptr_t)VirtualAlloc(NULL, 0x10000, MEM_RESERVE, PAGE_NOACCESS);
     AddVectoredExceptionHandler(1, native32_veh);
 }
