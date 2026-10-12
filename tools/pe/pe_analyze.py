@@ -422,12 +422,15 @@ def _analyze_with_struct(filepath: str, info: PEInfo) -> None:
                         dll_name = '???'
                     info.import_dlls.append(dll_name)
 
-                    # Walk ILT / IAT entries
+                    # Walk ILT / IAT entries. The names come from the ILT when
+                    # there is one, but the slot the code calls through is
+                    # always in the IAT (FirstThunk): the two tables are
+                    # parallel, not the same addresses.
                     lookup_rva = ilt_rva if ilt_rva else iat_rva_base
                     if lookup_rva:
                         loff = rva_to_offset(lookup_rva)
                         if loff:
-                            slot_rva = lookup_rva
+                            slot_rva = iat_rva_base
                             p = loff
                             while True:
                                 entry = struct.unpack_from('<I', data, p)[0]
