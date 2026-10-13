@@ -80,6 +80,7 @@ typedef struct {
     int      fp_top;
     uint16_t fpu_cw;
     uint64_t mm[8];
+    xmm_t    xmm[8];
 } regs_t;
 
 static void regs_save(regs_t *r) {
@@ -88,6 +89,7 @@ static void regs_save(regs_t *r) {
     r->fs=g_fs_base; r->cur=g_cur_func;
     memcpy(r->st, g_st, sizeof g_st); r->fp_top=g_fp_top; r->fpu_cw=g_fpu_cw;
     memcpy(r->mm, g_mm, sizeof g_mm);
+    memcpy(r->xmm, g_xmm, sizeof g_xmm);
 }
 static void regs_load(const regs_t *r) {
     g_eax=r->eax; g_ecx=r->ecx; g_edx=r->edx; g_esp=r->esp;
@@ -95,6 +97,7 @@ static void regs_load(const regs_t *r) {
     g_fs_base=r->fs; g_cur_func=r->cur;
     memcpy(g_st, r->st, sizeof g_st); g_fp_top=r->fp_top; g_fpu_cw=r->fpu_cw;
     memcpy(g_mm, r->mm, sizeof g_mm);
+    memcpy(g_xmm, r->xmm, sizeof g_xmm);     /* a loop's running sum is in one when the machine changes hands at a back-edge */
 }
 
 /* A guest thread's stack and simulated TIB. Lifted code reads fs:[n] as
