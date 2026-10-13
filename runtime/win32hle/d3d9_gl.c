@@ -46,6 +46,7 @@ const char *hle_d3d9_title = "Direct3D";
 const char *volatile hle_d3d9_doing = "nothing";       /* what the drawing half is in the middle of, for a watchdog */
 #define DOING(what) (hle_d3d9_doing = (what))
 int hle_d3d9_vsync;
+static int g_swap_interval = -1;               /* what the window was last told of hle_d3d9_vsync */
 
 static SDL_Window *g_win;
 static SDL_GLContext g_ctx;
@@ -57,8 +58,17 @@ static pthread_t g_owner, g_window_thread;
 static int g_owned;                            /* the context is some thread's: g_owner's */
 static volatile int g_wanted;                  /* another thread is waiting for it */
 static int g_have_aniso, g_max_tex = 4096, g_trace;
+static unsigned g_census_frame;                /* HLE_D3D9_CENSUS: every so many frames, one whose draws are counted */
 static GLuint g_vao, g_stream_vb, g_stream_ib;
 static GLuint g_cur_fbo = ~0u, g_cur_prog, g_cur_tex = ~0u;
+static GLuint g_cur_vb, g_cur_ib;              /* the buffers bound for vertices and for indices */
+/* What the vertex arrays were last pointed at: a buffer, where its first
+ * vertex is, how far apart the vertices are and what they are made of. A
+ * draw that reads the same says nothing about arrays at all. */
+static GLuint g_arr_buf;
+static size_t g_arr_base;
+static int g_arr_stride;
+static uint64_t g_arr_sig;
 static unsigned g_enabled;                     /* vertex arrays switched on, a bit each */
 static unsigned long g_draws;
 
@@ -123,7 +133,12 @@ static int gl_enter(void) {
         if (g_retired[i].tex) { glDeleteTextures(1, &g_retired[i].tex); if (g_cur_tex == g_retired[i].tex) g_cur_tex = ~0u; }
         if (g_retired[i].rb) glDeleteRenderbuffers(1, &g_retired[i].rb);
         if (g_retired[i].fbo) glDeleteFramebuffers(1, &g_retired[i].fbo);
-        if (g_retired[i].buf) glDeleteBuffers(1, &g_retired[i].buf);
+        if (g_retired[i].buf) {
+            glDeleteBuffers(1, &g_retired[i].buf);          /* and its name may be given out again */
+            if (g_cur_vb == g_retired[i].buf) g_cur_vb = 0;
+            if (g_cur_ib == g_retired[i].buf) g_cur_ib = 0;
+            if (g_arr_buf == g_retired[i].buf) g_arr_buf = 0;
+        }
     }
     g_nretired = 0;
     return 1;
@@ -135,9 +150,11 @@ static void bind_fbo(GLuint f) { if (g_cur_fbo != f) glBindFramebuffer(GL_FRAMEB
 /* The GL texture behind a surface that is drawn into, made on first use. A
  * format without alpha is kept with its alpha at 1 (cleared so here, and
  * never written: see apply_state). */
+static void state_forget(void);
 static GLuint target_texture(d3d9_surface *s) {
     GLuint *name = s->kind == D3D9_SURF_LEVEL ? &s->tex->gl : &s->gl_tex;
     if (!*name) {
+        state_forget();                        /* the clear below has a mask and a scissor of its own */
         glGenTextures(1, name);
         bind_texture(*name);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, s->w, s->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
@@ -296,7 +313,7 @@ static int open_window(int w, int h) {
     if (!g_win) { fprintf(stderr, "[d3d9] no window: %s\n", SDL_GetError()); return -1; }
     g_ctx = SDL_GL_CreateContext(g_win);
     if (!g_ctx) { fprintf(stderr, "[d3d9] no OpenGL ES 3 context: %s\n", SDL_GetError()); return -1; }
-    SDL_GL_SetSwapInterval(hle_d3d9_vsync);
+    SDL_GL_SetSwapInterval(hle_d3d9_vsync), g_swap_interval = hle_d3d9_vsync;
     g_window_thread = pthread_self();
     hle_set_pump_hook(pump);
     return 0;
@@ -315,6 +332,7 @@ int d3d9_gl_open(int w, int h, int headless) {
     const char *ext = (const char *)glGetString(GL_EXTENSIONS);
     g_have_aniso = ext && strstr(ext, "texture_filter_anisotropic");
     g_trace = getenv("HLE_D3D9_TRACE") != NULL;
+    if (getenv("HLE_D3D9_CENSUS")) g_census_frame = (unsigned)atoi(getenv("HLE_D3D9_CENSUS"));
     glGetIntegerv(GL_MAX_TEXTURE_SIZE, &g_max_tex);
     fprintf(stderr, "[d3d9] %s, %s (%s)\n", (const char *)glGetString(GL_VERSION), (const char *)glGetString(GL_RENDERER),
             headless ? "no window" : "window");
@@ -346,7 +364,15 @@ static uint8_t *scratch(size_t n) {
 }
 static void swap_rb(uint8_t *px, size_t n) { for (size_t i = 0; i < n; i++, px += 4) { uint8_t t = px[0]; px[0] = px[2], px[2] = t; } }
 
-static GLuint sampled_texture(d3d9_texture *t) {
+static GLuint texture_ready(d3d9_texture *t);
+static GLuint sampled_texture(d3d9_texture *t) {         /* timed when there is something to fill */
+    if (!(t->usage & D3DUSAGE_RENDERTARGET) && t->gl && !t->dirty) return t->gl;
+    uint64_t t0 = hle_now_ns();
+    GLuint gl = texture_ready(t);
+    hle_perf.texture_ns += hle_now_ns() - t0, hle_perf.textures++;
+    return gl;
+}
+static GLuint texture_ready(d3d9_texture *t) {
     if (t->usage & D3DUSAGE_RENDERTARGET) return target_texture(t->level[0]);
     int fresh = !t->gl;
     if (fresh) {
@@ -421,6 +447,7 @@ void d3d9_gl_blit(d3d9_surface *from, const int *fr, d3d9_surface *to, const int
     glDisable(GL_SCISSOR_TEST);
     glColorMask(1, 1, 1, 1);
     glBlitFramebuffer(fr[0], fr[1], fr[2], fr[3], tr[0], tr[1], tr[2], tr[3], GL_COLOR_BUFFER_BIT, linear ? GL_LINEAR : GL_NEAREST);
+    state_forget();
 }
 
 /* ---- render state ------------------------------------------------------------------- */
@@ -450,49 +477,95 @@ static void color_of(uint32_t c, float *f) {   /* a D3DCOLOR as r, g, b, a */
 }
 static float rs_float(int which) { float f; memcpy(&f, &d3d9.rs[which], 4); return f; }
 
-/* The framebuffer, viewport and per-pixel state of the device, given to GL. */
+/* The framebuffer, viewport and per-pixel state of the device, given to GL:
+ * only what is not as GL was last told. Most of a frame's draws differ from
+ * the one before in a texture and a matrix, and each of these calls is a
+ * trip into the driver. Whatever else sets one of them (a clear, a present,
+ * a copy between surfaces, a host's picture) calls state_forget, and the
+ * next draw says everything again. */
+static struct {
+    int known;
+    GLint vx, vy;
+    GLsizei vw, vh;
+    float zn, zf;
+    int scissor, sx, sy, sw, sh;
+    int depth, zwrite;
+    GLenum zfunc;
+    int blend, separate;
+    GLenum sf, df, saf, daf, eq, eqa;
+    uint32_t bcolor;
+    int cull;
+    GLenum face;
+    int mask;
+} g_gl;
+static void state_forget(void) { g_gl.known = 0; }
+
 static void apply_state(void) {
     const uint32_t *rs = d3d9.rs;
     bind_fbo(fbo_for(d3d9.rt, d3d9.ds));
-    glViewport((GLint)d3d9.vp.x, (GLint)d3d9.vp.y, (GLsizei)d3d9.vp.w, (GLsizei)d3d9.vp.h);
-    glDepthRangef(d3d9.vp.minz, d3d9.vp.maxz);
-    if (rs[D3DRS_SCISSORTESTENABLE]) {
-        glEnable(GL_SCISSOR_TEST);
-        glScissor(d3d9.scissor[0], d3d9.scissor[1], d3d9.scissor[2] - d3d9.scissor[0], d3d9.scissor[3] - d3d9.scissor[1]);
-    } else glDisable(GL_SCISSOR_TEST);
-    if (rs[D3DRS_ZENABLE] && d3d9.ds) {
-        glEnable(GL_DEPTH_TEST);
-        glDepthFunc(GL_NEVER + (rs[D3DRS_ZFUNC] >= 1 && rs[D3DRS_ZFUNC] <= 8 ? rs[D3DRS_ZFUNC] - 1 : 7));
-        glDepthMask(rs[D3DRS_ZWRITEENABLE] != 0);
-    } else glDisable(GL_DEPTH_TEST);
-    if (rs[D3DRS_ALPHABLENDENABLE]) {
+    int all = !g_gl.known;
+    GLint vx = (GLint)d3d9.vp.x, vy = (GLint)d3d9.vp.y;
+    GLsizei vw = (GLsizei)d3d9.vp.w, vh = (GLsizei)d3d9.vp.h;
+    if (all || vx != g_gl.vx || vy != g_gl.vy || vw != g_gl.vw || vh != g_gl.vh)
+        glViewport(vx, vy, vw, vh), g_gl.vx = vx, g_gl.vy = vy, g_gl.vw = vw, g_gl.vh = vh;
+    if (all || d3d9.vp.minz != g_gl.zn || d3d9.vp.maxz != g_gl.zf)
+        glDepthRangef(d3d9.vp.minz, d3d9.vp.maxz), g_gl.zn = d3d9.vp.minz, g_gl.zf = d3d9.vp.maxz;
+    int scissor = rs[D3DRS_SCISSORTESTENABLE] != 0;
+    if (scissor) {
+        int sx = d3d9.scissor[0], sy = d3d9.scissor[1], sw = d3d9.scissor[2] - d3d9.scissor[0], sh = d3d9.scissor[3] - d3d9.scissor[1];
+        if (all || !g_gl.scissor) glEnable(GL_SCISSOR_TEST);
+        if (all || !g_gl.scissor || sx != g_gl.sx || sy != g_gl.sy || sw != g_gl.sw || sh != g_gl.sh)
+            glScissor(sx, sy, sw, sh), g_gl.sx = sx, g_gl.sy = sy, g_gl.sw = sw, g_gl.sh = sh;
+    } else if (all || g_gl.scissor) glDisable(GL_SCISSOR_TEST);
+    g_gl.scissor = scissor;
+    int depth = rs[D3DRS_ZENABLE] && d3d9.ds;
+    if (depth) {
+        GLenum zfunc = GL_NEVER + (rs[D3DRS_ZFUNC] >= 1 && rs[D3DRS_ZFUNC] <= 8 ? rs[D3DRS_ZFUNC] - 1 : 7);
+        int zwrite = rs[D3DRS_ZWRITEENABLE] != 0;
+        if (all || !g_gl.depth) glEnable(GL_DEPTH_TEST);
+        if (all || !g_gl.depth || zfunc != g_gl.zfunc) glDepthFunc(zfunc), g_gl.zfunc = zfunc;
+        if (all || !g_gl.depth || zwrite != g_gl.zwrite) glDepthMask((GLboolean)zwrite), g_gl.zwrite = zwrite;
+    } else if (all || g_gl.depth) glDisable(GL_DEPTH_TEST);
+    g_gl.depth = depth;
+    int blend = rs[D3DRS_ALPHABLENDENABLE] != 0;
+    if (blend) {
         static const GLenum eq[] = { GL_FUNC_ADD, GL_FUNC_ADD, GL_FUNC_SUBTRACT, GL_FUNC_REVERSE_SUBTRACT, GL_MIN, GL_MAX };
-        float f[4];
-        glEnable(GL_BLEND);
-        if (rs[D3DRS_SEPARATEALPHABLENDENABLE]) {
-            glBlendFuncSeparate(blend_factor(rs[D3DRS_SRCBLEND], 0), blend_factor(rs[D3DRS_DESTBLEND], 1),
-                                blend_factor(rs[D3DRS_SRCBLENDALPHA], 0), blend_factor(rs[D3DRS_DESTBLENDALPHA], 1));
-            glBlendEquationSeparate(eq[rs[D3DRS_BLENDOP] < 6 ? rs[D3DRS_BLENDOP] : 0], eq[rs[D3DRS_BLENDOPALPHA] < 6 ? rs[D3DRS_BLENDOPALPHA] : 0]);
-        } else {
-            glBlendFunc(blend_factor(rs[D3DRS_SRCBLEND], 0), blend_factor(rs[D3DRS_DESTBLEND], 1));
-            glBlendEquation(eq[rs[D3DRS_BLENDOP] < 6 ? rs[D3DRS_BLENDOP] : 0]);
+        int separate = rs[D3DRS_SEPARATEALPHABLENDENABLE] != 0;
+        GLenum sf = blend_factor(rs[D3DRS_SRCBLEND], 0), df = blend_factor(rs[D3DRS_DESTBLEND], 1);
+        GLenum saf = separate ? blend_factor(rs[D3DRS_SRCBLENDALPHA], 0) : sf, daf = separate ? blend_factor(rs[D3DRS_DESTBLENDALPHA], 1) : df;
+        GLenum e = eq[rs[D3DRS_BLENDOP] < 6 ? rs[D3DRS_BLENDOP] : 0], ea = separate ? eq[rs[D3DRS_BLENDOPALPHA] < 6 ? rs[D3DRS_BLENDOPALPHA] : 0] : e;
+        int again = all || !g_gl.blend;
+        if (again) glEnable(GL_BLEND);
+        if (again || sf != g_gl.sf || df != g_gl.df || saf != g_gl.saf || daf != g_gl.daf)
+            glBlendFuncSeparate(sf, df, saf, daf), g_gl.sf = sf, g_gl.df = df, g_gl.saf = saf, g_gl.daf = daf;
+        if (again || e != g_gl.eq || ea != g_gl.eqa) glBlendEquationSeparate(e, ea), g_gl.eq = e, g_gl.eqa = ea;
+        if (again || rs[D3DRS_BLENDFACTOR] != g_gl.bcolor) {
+            float f[4];
+            color_of(rs[D3DRS_BLENDFACTOR], f);
+            glBlendColor(f[0], f[1], f[2], f[3]);
+            g_gl.bcolor = rs[D3DRS_BLENDFACTOR];
         }
-        color_of(rs[D3DRS_BLENDFACTOR], f);
-        glBlendColor(f[0], f[1], f[2], f[3]);
-    } else glDisable(GL_BLEND);
+    } else if (all || g_gl.blend) glDisable(GL_BLEND);
+    g_gl.blend = blend;
     /* Clockwise on Direct3D's screen is counter-clockwise on this one, drawn
      * upside down: GL's front faces are the ones Direct3D calls clockwise. */
-    if (rs[D3DRS_CULLMODE] == D3DCULL_CW || rs[D3DRS_CULLMODE] == D3DCULL_CCW) {
-        glEnable(GL_CULL_FACE);
-        glCullFace(rs[D3DRS_CULLMODE] == D3DCULL_CCW ? GL_BACK : GL_FRONT);
-    } else glDisable(GL_CULL_FACE);
+    int cull = rs[D3DRS_CULLMODE] == D3DCULL_CW || rs[D3DRS_CULLMODE] == D3DCULL_CCW;
+    if (cull) {
+        GLenum face = rs[D3DRS_CULLMODE] == D3DCULL_CCW ? GL_BACK : GL_FRONT;
+        if (all || !g_gl.cull) glEnable(GL_CULL_FACE);
+        if (all || !g_gl.cull || face != g_gl.face) glCullFace(face), g_gl.face = face;
+    } else if (all || g_gl.cull) glDisable(GL_CULL_FACE);
+    g_gl.cull = cull;
     uint32_t cw = rs[D3DRS_COLORWRITEENABLE];
-    glColorMask((cw & 1) != 0, (cw & 2) != 0, (cw & 4) != 0, (cw & 8) != 0 && d3d9_fmt_alpha(d3d9.rt->fmt));
+    int mask = (int)(cw & 7) | ((cw & 8) && d3d9_fmt_alpha(d3d9.rt->fmt) ? 8 : 0);
+    if (all || mask != g_gl.mask) glColorMask((mask & 1) != 0, (mask & 2) != 0, (mask & 4) != 0, (mask & 8) != 0), g_gl.mask = mask;
     if (rs[D3DRS_STENCILENABLE]) { static int said; if (!said++) fprintf(stderr, "[d3d9] not done: the stencil buffer\n"); }
+    g_gl.known = 1;
 }
 
 void d3d9_gl_clear(uint32_t flags, uint32_t color, float z, uint32_t stencil) {
     if (!gl_enter()) return;
+    uint64_t t0 = hle_now_ns();
     DOING("clearing");
     GLbitfield bits = 0;
     float f[4];
@@ -508,6 +581,8 @@ void d3d9_gl_clear(uint32_t flags, uint32_t color, float z, uint32_t stencil) {
     if ((flags & D3DCLEAR_ZBUFFER) && d3d9.ds) { glDepthMask(1); glClearDepthf(z); bits |= GL_DEPTH_BUFFER_BIT; }
     if ((flags & D3DCLEAR_STENCIL) && d3d9.ds) { glStencilMask(~0u); glClearStencil((GLint)stencil); bits |= GL_STENCIL_BUFFER_BIT; }
     if (bits) glClear(bits);
+    state_forget();
+    hle_perf.clear_ns += hle_now_ns() - t0;
     DOING("nothing");
 }
 
@@ -530,7 +605,12 @@ typedef struct {
     GLuint id;
     GLint view, fog, fogcolor, aref, tfactor, wvp, wv, c, mat, amb, lpos, ldir, ldif, lamb, latt, lspot;
     int nconst;
+    /* what it was last sent, so that the same is not sent again */
+    unsigned sent, consts;          /* SENT_* bits; the constants' serial + 1 */
+    float u_view[4], u_fog[8], u_aref, u_wvp[16], u_wv[16];
+    uint32_t u_tfactor;
 } prog;
+enum { SENT_VIEW = 1, SENT_FOG = 2, SENT_AREF = 4, SENT_TFACTOR = 8, SENT_WVP = 16, SENT_WV = 32 };
 static prog g_prog[512];
 static int g_nprog;
 
@@ -712,8 +792,17 @@ static GLuint compile(GLenum kind, const char *src) {
     }
     return s;
 }
-static prog *program_for(const prog_key *k, const d3d9_vshader *vs) {
-    for (int i = 0; i < g_nprog; i++) if (!memcmp(&g_prog[i].key, k, sizeof *k)) return &g_prog[i];
+static prog *program_new(const prog_key *k, const d3d9_vshader *vs);
+static prog *program_for(const prog_key *k, const d3d9_vshader *vs) {      /* timed when one has to be made */
+    static prog *last;                         /* a draw mostly wants the program of the draw before */
+    if (last && !memcmp(&last->key, k, sizeof *k)) return last;
+    for (int i = 0; i < g_nprog; i++) if (!memcmp(&g_prog[i].key, k, sizeof *k)) return last = &g_prog[i];
+    uint64_t t0 = hle_now_ns();
+    prog *p = program_new(k, vs);
+    hle_perf.program_ns += hle_now_ns() - t0, hle_perf.programs++;
+    return p;
+}
+static prog *program_new(const prog_key *k, const d3d9_vshader *vs) {
     if (g_nprog >= 512) return NULL;
     prog *p = &g_prog[g_nprog++];
     memset(p, 0, sizeof *p);
@@ -789,6 +878,7 @@ static void set_array(unsigned loc, const elem *e, int stride, const uint8_t *ba
                           (const void *)((uintptr_t)base + (uintptr_t)e->offset));
 }
 static void enable_arrays(unsigned want) {
+    if (want == g_enabled) return;
     for (unsigned i = 0; i < 16; i++) {
         unsigned bit = 1u << i;
         if ((want & bit) && !(g_enabled & bit)) glEnableVertexAttribArray(i);
@@ -797,30 +887,152 @@ static void enable_arrays(unsigned want) {
     g_enabled = want;
 }
 
-void d3d9_gl_draw(const d3d9_draw *d) {
-    static const GLenum mode[] = { 0, GL_POINTS, GL_LINES, GL_LINE_STRIP, GL_TRIANGLES, GL_TRIANGLE_STRIP, GL_TRIANGLE_FAN };
-    const uint32_t *rs = d3d9.rs;
+/* Vertices and indices that are sent with their draw go one after another
+ * into a buffer that is thrown away for a fresh one only when it is full: a
+ * buffer a draw, allocated and filled, was most of the driver's work for
+ * small draws. A range is written through a mapping that asks for no
+ * waiting (nothing still being drawn is overwritten). */
+typedef struct { GLenum target; size_t room, cap, at; } stream;
+static stream g_vstream = { GL_ARRAY_BUFFER, 4u << 20, 0, 0 }, g_istream = { GL_ELEMENT_ARRAY_BUFFER, 1u << 20, 0, 0 };
+static size_t stream_put(stream *st, const void *src, size_t n, size_t align) {
+    size_t at = (st->at + align - 1) / align * align;
+    if (!st->cap || at + n > st->cap) {
+        st->cap = n > st->room ? n : st->room;
+        glBufferData(st->target, (GLsizeiptr)st->cap, NULL, GL_STREAM_DRAW);
+        at = 0;
+    }
+    void *to = glMapBufferRange(st->target, (GLintptr)at, (GLsizeiptr)n, GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+    if (to) memcpy(to, src, n), glUnmapBuffer(st->target);
+    else glBufferSubData(st->target, (GLintptr)at, (GLsizeiptr)n, src);
+    st->at = at + n;
+    return at;
+}
+
+/* HLE_D3D9_CENSUS=N: what the draws of every Nth frame were, in a few lines of the
+ * log: how many of each kind, how large, and how many came with the same
+ * program, texture and state as the draw before them (the ones that could
+ * be drawn together). */
+static struct {
+    unsigned n, rhw, fixed, shader, user, dynamic, kept, indexed, upto4, upto16, upto64, more, lists, strips, fans, other;
+    unsigned same_state, same_all, textured, sends, sent;
+    uint64_t last_state, last_all;
+} g_census;
+static uint64_t mix(uint64_t h, uint64_t v) { return (h ^ v) * 1099511628211ull; }
+static void census_draw(const d3d9_draw *d, const prog *p, int mode, GLuint tex, int streamed) {
+    static const int which[] = { D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DRS_ALPHABLENDENABLE, D3DRS_SRCBLEND, D3DRS_DESTBLEND,
+                                 D3DRS_BLENDOP, D3DRS_CULLMODE, D3DRS_COLORWRITEENABLE, D3DRS_SCISSORTESTENABLE, D3DRS_ALPHAREF,
+                                 D3DRS_TEXTUREFACTOR, D3DRS_FOGSTART, D3DRS_FOGEND, D3DRS_FOGCOLOR };
+    uint64_t h = mix(mix(1469598103934665603ull, p->id), tex);
+    for (unsigned i = 0; i < sizeof which / sizeof which[0]; i++) h = mix(h, d3d9.rs[which[i]]);
+    h = mix(mix(mix(mix(h, d3d9.vp.x), d3d9.vp.y), d3d9.vp.w), d3d9.vp.h);
+    h = mix(mix(h, (uintptr_t)d3d9.rt), (uintptr_t)d3d9.ds);
+    h = mix(h, (uint64_t)d->prim);
+    uint64_t all = h;
+    if (mode == MODE_FIXED) {
+        const uint32_t *w = (const uint32_t *)d3d9.world, *v = (const uint32_t *)d3d9.view, *pr = (const uint32_t *)d3d9.proj;
+        for (int i = 0; i < 16; i++) all = mix(mix(mix(all, w[i]), v[i]), pr[i]);
+    } else if (mode == MODE_SHADER) all = mix(all, d3d9.vsc_serial);
+    g_census.n++;
+    if (mode == MODE_RHW) g_census.rhw++; else if (mode == MODE_FIXED) g_census.fixed++; else g_census.shader++;
+    if (d->user_verts) g_census.user++; else if (streamed) g_census.dynamic++; else g_census.kept++;
+    if (d->indexed) g_census.indexed++;
+    if (tex) g_census.textured++;
+    if (d->num_vertices <= 4) g_census.upto4++; else if (d->num_vertices <= 16) g_census.upto16++; else if (d->num_vertices <= 64) g_census.upto64++; else g_census.more++;
+    if (d->prim == D3DPT_TRIANGLELIST) g_census.lists++; else if (d->prim == D3DPT_TRIANGLESTRIP) g_census.strips++;
+    else if (d->prim == D3DPT_TRIANGLEFAN) g_census.fans++; else g_census.other++;
+    if (g_census.n > 1 && h == g_census.last_state) g_census.same_state++;
+    if (g_census.n > 1 && all == g_census.last_all) g_census.same_all++;
+    g_census.last_state = h, g_census.last_all = all;
+}
+static void census_say(void) {
+    fprintf(stderr, "[d3d9] frame %u: %u draws; already transformed %u, fixed function %u, vertex shader %u; with a texture %u\n",
+            d3d9.frame, g_census.n, g_census.rhw, g_census.fixed, g_census.shader, g_census.textured);
+    fprintf(stderr, "[d3d9]   vertices with the draw %u, from a buffer the game rewrites %u, from one GL keeps %u; indexed %u\n",
+            g_census.user, g_census.dynamic, g_census.kept, g_census.indexed);
+    fprintf(stderr, "[d3d9]   up to 4 vertices %u, up to 16 %u, up to 64 %u, more %u; lists %u, strips %u, fans %u, lines and points %u\n",
+            g_census.upto4, g_census.upto16, g_census.upto64, g_census.more, g_census.lists, g_census.strips, g_census.fans, g_census.other);
+    fprintf(stderr, "[d3d9]   as the draw before: program, texture and state %u; and matrices or constants too %u\n",
+            g_census.same_state, g_census.same_all);
+    fprintf(stderr, "[d3d9]   a shader's constants sent %u times, %u of them each time\n",
+            g_census.sends, g_census.sends ? g_census.sent / g_census.sends : 0);
+    memset(&g_census, 0, sizeof g_census);
+}
+
+/* What a vertex is made of and which of it a program reads, worked out once
+ * for each pairing of a layout (a declaration, or an FVF code) with a vertex
+ * shader (or none) and kept: for every draw it was forty searches of the
+ * layout, in a frame of nine hundred draws. */
+typedef struct {
+    int32_t decl;                   /* the declaration's number, or minus the FVF code */
+    const d3d9_vshader *vs;
+    int32_t vs_id;
+    int nel;
     elem el[40];
-    int nel = 0;
+    const elem *pos, *post, *d0, *d1, *n, *t0;
+    const elem *arr[16];            /* what each of the program's inputs reads; NULL: nothing */
+    unsigned want, colors;          /* the inputs that read something; those that read a D3DCOLOR */
+    uint64_t sig;                   /* of what the inputs read: the same layout by another name has the same */
+} layout;
+static layout g_layout[64];
+static int g_nlayout;
+static const layout *layout_for(const d3d9_vshader *vs) {
+    static const layout *last;
+    static unsigned turn;
+    int32_t decl = d3d9.decl ? d3d9.decl->id : -(int32_t)(d3d9.fvf & 0x7FFFFFFF), vs_id = vs ? vs->id : 0;
+    if (last && last->decl == decl && last->vs == vs && last->vs_id == vs_id) return last;
+    for (int i = 0; i < g_nlayout; i++)
+        if (g_layout[i].decl == decl && g_layout[i].vs == vs && g_layout[i].vs_id == vs_id) return last = &g_layout[i];
+    layout *l = &g_layout[g_nlayout < 64 ? g_nlayout++ : (int)(turn++ & 63)];      /* full: the seats are used again in turn */
+    memset(l, 0, sizeof *l);
+    l->decl = decl, l->vs = vs, l->vs_id = vs_id;
+    if (d3d9.decl) {
+        for (int i = 0; i < d3d9.decl->n && l->nel < 40; i++)
+            if (d3d9.decl->el[i].stream == 0)
+                l->el[l->nel++] = (elem){ d3d9.decl->el[i].offset, d3d9.decl->el[i].type, d3d9.decl->el[i].usage, d3d9.decl->el[i].index };
+    } else l->nel = elems_from_fvf(d3d9.fvf, l->el);
+    l->pos = find_elem(l->el, l->nel, 0, 0), l->post = find_elem(l->el, l->nel, 9, 0);
+    l->d0 = find_elem(l->el, l->nel, 10, 0), l->d1 = find_elem(l->el, l->nel, 10, 1);
+    l->n = find_elem(l->el, l->nel, 3, 0), l->t0 = find_elem(l->el, l->nel, 5, 0);
+    if (vs) {
+        for (int i = 0; i < 16; i++)
+            l->arr[i] = vs->info.in[i].declared ? find_elem(l->el, l->nel, vs->info.in[i].usage, vs->info.in[i].usage_index) : NULL;
+    } else l->arr[0] = l->post ? l->post : l->pos, l->arr[1] = l->n, l->arr[2] = l->d0, l->arr[3] = l->d1, l->arr[4] = l->t0;
+    l->sig = 1469598103934665603ull;
+    for (unsigned i = 0; i < 16; i++) {
+        if (!l->arr[i]) continue;
+        l->want |= 1u << i;
+        if (l->arr[i]->type == D3DDECLTYPE_D3DCOLOR) l->colors |= 1u << i;
+        l->sig = mix(l->sig, (uint64_t)i << 24 | (uint64_t)l->arr[i]->offset << 8 | (uint64_t)l->arr[i]->type);
+    }
+    return last = l;
+}
+
+static void draw_one(const d3d9_draw *d);
+void d3d9_gl_draw(const d3d9_draw *d) {
+    hle_perf.draws++;
+    if (!hle_perf_on) { draw_one(d); return; }
+    uint64_t t0 = hle_now_ns();
+    draw_one(d);
+    hle_perf.draw_ns += hle_now_ns() - t0;
+}
+#define PHASE(i) do { if (tp) { uint64_t now_ = hle_now_ns(); hle_perf.phase_ns[i] += now_ - tp, tp = now_; } } while (0)
+static void draw_one(const d3d9_draw *d) {
+    static const GLenum mode[] = { 0, GL_POINTS, GL_LINES, GL_LINE_STRIP, GL_TRIANGLES, GL_TRIANGLE_STRIP, GL_TRIANGLE_FAN };
+    uint64_t tp = hle_perf_phases ? hle_now_ns() : 0;
+    const uint32_t *rs = d3d9.rs;
     if (!gl_enter() || d->prim < 1 || d->prim > 6) return;
 
     /* what a vertex is made of */
-    if (d3d9.decl) {
-        for (int i = 0; i < d3d9.decl->n; i++)
-            if (d3d9.decl->el[i].stream == 0)
-                el[nel++] = (elem){ d3d9.decl->el[i].offset, d3d9.decl->el[i].type, d3d9.decl->el[i].usage, d3d9.decl->el[i].index };
-    } else nel = elems_from_fvf(d3d9.fvf, el);
-    int stride = d->user_verts ? d->user_stride : (int)d3d9.vb_stride;
-    if (!nel || stride <= 0 || (!d->user_verts && !d3d9.vb)) return;
     d3d9_vshader *vs = d3d9.vs;
     if (vs && !vs->glsl) return;
+    const layout *lay = layout_for(vs);
+    int stride = d->user_verts ? d->user_stride : (int)d3d9.vb_stride;
+    if (!lay->nel || stride <= 0 || (!d->user_verts && !d3d9.vb)) return;
 
     /* the program for this draw's state */
     prog_key k;
     memset(&k, 0, sizeof k);
-    const elem *e_pos = find_elem(el, nel, 0, 0), *e_post = find_elem(el, nel, 9, 0);
-    const elem *e_d0 = find_elem(el, nel, 10, 0), *e_d1 = find_elem(el, nel, 10, 1);
-    const elem *e_n = find_elem(el, nel, 3, 0), *e_t0 = find_elem(el, nel, 5, 0);
+    const elem *e_pos = lay->pos, *e_post = lay->post, *e_d0 = lay->d0, *e_d1 = lay->d1, *e_n = lay->n, *e_t0 = lay->t0;
     d3d9_texture *tex = d3d9.tex[0];
     settle_stage(&k, tex != NULL);
     int perspective = d3d9.proj[3] != 0.0f || d3d9.proj[7] != 0.0f || d3d9.proj[11] != 0.0f || d3d9.proj[15] != 1.0f;
@@ -834,11 +1046,8 @@ void d3d9_gl_draw(const d3d9_draw *d) {
     k.atest = (uint8_t)(rs[D3DRS_ALPHATESTENABLE] ? (rs[D3DRS_ALPHAFUNC] >= 1 && rs[D3DRS_ALPHAFUNC] <= 7 ? rs[D3DRS_ALPHAFUNC] : 0) : 0);
     k.spec_add = (uint8_t)(rs[D3DRS_SPECULARENABLE] != 0);
     if (vs) {
-        k.mode = MODE_SHADER, k.vs = vs->id, k.decl = d3d9.decl ? d3d9.decl->id : -(int32_t)(d3d9.fvf & 0x7FFFFFFF);
-        for (int i = 0; i < 16; i++) {
-            const elem *e = vs->info.in[i].declared ? find_elem(el, nel, vs->info.in[i].usage, vs->info.in[i].usage_index) : NULL;
-            if (e && e->type == D3DDECLTYPE_D3DCOLOR) k.colors |= 1u << i;
-        }
+        k.mode = MODE_SHADER, k.vs = vs->id, k.decl = lay->decl;
+        k.colors = lay->colors;
     } else {
         if (!e_pos && !e_post) return;
         k.mode = (uint8_t)(e_post ? MODE_RHW : MODE_FIXED);
@@ -859,6 +1068,7 @@ void d3d9_gl_draw(const d3d9_draw *d) {
 
     DOING("filling a texture");
     GLuint gltex = k.sample ? sampled_texture(tex) : 0;      /* before the state: making one may disturb it */
+    PHASE(0);
     DOING("setting the state");
     apply_state();
     if (g_cur_prog != p->id) glUseProgram(p->id), g_cur_prog = p->id;
@@ -867,33 +1077,47 @@ void d3d9_gl_draw(const d3d9_draw *d) {
         apply_sampler(tex);
     }
 
+    PHASE(1);
     DOING("setting uniforms");
-    /* uniforms */
-    float vw = (float)(d3d9.vp.w ? d3d9.vp.w : 1), vh = (float)(d3d9.vp.h ? d3d9.vp.h : 1), f[4];
-    if (k.mode == MODE_RHW) glUniform4f(p->view, 2.0f / vw, 2.0f / vh, (float)d3d9.vp.x, (float)d3d9.vp.y);
-    else glUniform4f(p->view, 1.0f / vw, 1.0f / vh, 0.0f, 0.0f);
+    /* uniforms: each only when it is not what this program was last sent */
+    float vw = (float)(d3d9.vp.w ? d3d9.vp.w : 1), vh = (float)(d3d9.vp.h ? d3d9.vp.h : 1), f[8];
+    if (k.mode == MODE_RHW) f[0] = 2.0f / vw, f[1] = 2.0f / vh, f[2] = (float)d3d9.vp.x, f[3] = (float)d3d9.vp.y;
+    else f[0] = 1.0f / vw, f[1] = 1.0f / vh, f[2] = f[3] = 0.0f;
+    if (!(p->sent & SENT_VIEW) || memcmp(p->u_view, f, 16)) glUniform4fv(p->view, 1, f), memcpy(p->u_view, f, 16), p->sent |= SENT_VIEW;
     if (k.fog) {
-        glUniform4f(p->fog, rs_float(D3DRS_FOGSTART), rs_float(D3DRS_FOGEND), rs_float(D3DRS_FOGDENSITY), 0.0f);
-        color_of(rs[D3DRS_FOGCOLOR], f);
-        glUniform4fv(p->fogcolor, 1, f);
+        f[0] = rs_float(D3DRS_FOGSTART), f[1] = rs_float(D3DRS_FOGEND), f[2] = rs_float(D3DRS_FOGDENSITY), f[3] = 0.0f;
+        color_of(rs[D3DRS_FOGCOLOR], f + 4);
+        if (!(p->sent & SENT_FOG) || memcmp(p->u_fog, f, 32))
+            glUniform4fv(p->fog, 1, f), glUniform4fv(p->fogcolor, 1, f + 4), memcpy(p->u_fog, f, 32), p->sent |= SENT_FOG;
     }
-    if (k.atest) glUniform1f(p->aref, (float)(rs[D3DRS_ALPHAREF] & 255));
-    if (p->tfactor >= 0) { color_of(rs[D3DRS_TEXTUREFACTOR], f); glUniform4fv(p->tfactor, 1, f); }
+    if (k.atest) {
+        float ref = (float)(rs[D3DRS_ALPHAREF] & 255);
+        if (!(p->sent & SENT_AREF) || p->u_aref != ref) glUniform1f(p->aref, ref), p->u_aref = ref, p->sent |= SENT_AREF;
+    }
+    if (p->tfactor >= 0 && (!(p->sent & SENT_TFACTOR) || p->u_tfactor != rs[D3DRS_TEXTUREFACTOR])) {
+        color_of(rs[D3DRS_TEXTUREFACTOR], f);
+        glUniform4fv(p->tfactor, 1, f);
+        p->u_tfactor = rs[D3DRS_TEXTUREFACTOR], p->sent |= SENT_TFACTOR;
+    }
     if (k.mode == MODE_SHADER) {
-        if (p->c >= 0 && p->nconst > 0) {
+        if (p->c >= 0 && p->nconst > 0 && p->consts != d3d9.vsc_serial + 1) {
             if (vs->info.ndefs) {              /* constants the shader defines itself win over the device's */
                 static float c[256][4];
                 memcpy(c, d3d9.vsc, sizeof c);
                 for (int i = 0; i < vs->info.ndefs; i++) if (vs->info.def[i].reg >= 0 && vs->info.def[i].reg < 256) memcpy(c[vs->info.def[i].reg], vs->info.def[i].v, 16);
                 glUniform4fv(p->c, p->nconst > 256 ? 256 : p->nconst, &c[0][0]);
             } else glUniform4fv(p->c, p->nconst > 256 ? 256 : p->nconst, &d3d9.vsc[0][0]);
+            p->consts = d3d9.vsc_serial + 1;
+            if (g_census_frame && (d3d9.frame + 1) % g_census_frame == 0) g_census.sends++, g_census.sent += (unsigned)(p->nconst > 256 ? 256 : p->nconst);
         }
     } else if (k.mode == MODE_FIXED) {
         float wv[16], wvp[16];
         mat_mul(wv, d3d9.world, d3d9.view);
         mat_mul(wvp, wv, d3d9.proj);
-        glUniformMatrix4fv(p->wvp, 1, GL_FALSE, wvp);      /* rows here are columns there: the vector moves to the right */
-        if (p->wv >= 0) glUniformMatrix4fv(p->wv, 1, GL_FALSE, wv);
+        if (!(p->sent & SENT_WVP) || memcmp(p->u_wvp, wvp, 64))        /* rows here are columns there: the vector moves to the right */
+            glUniformMatrix4fv(p->wvp, 1, GL_FALSE, wvp), memcpy(p->u_wvp, wvp, 64), p->sent |= SENT_WVP;
+        if (p->wv >= 0 && (!(p->sent & SENT_WV) || memcmp(p->u_wv, wv, 64)))
+            glUniformMatrix4fv(p->wv, 1, GL_FALSE, wv), memcpy(p->u_wv, wv, 64), p->sent |= SENT_WV;
         if (k.lighting) {
             float lp[4][4] = { { 0 } }, ld[4][4] = { { 0 } }, ldf[4][4] = { { 0 } }, la[4][4] = { { 0 } }, lat[4][4] = { { 0 } }, ls[4][4] = { { 0 } };
             const float *V = d3d9.view;
@@ -919,72 +1143,82 @@ void d3d9_gl_draw(const d3d9_draw *d) {
     }
 
     /* Vertices. A buffer the guest keeps rewriting, and vertices handed over
-     * with the draw, are sent as just the vertices this draw uses; the indices
-     * then count from the first of those. Any other buffer is GL's own copy. */
+     * with the draw, are sent as just the vertices this draw uses, into the
+     * stream; any other buffer is GL's own copy. Either way the arrays stay
+     * pointed at the buffer's start and the draw says which vertex is its
+     * first, so that draw after draw from one buffer says nothing of arrays. */
+    PHASE(2);
     DOING("sending vertices");
     int nidx = d->indexed ? (d->prim == D3DPT_TRIANGLELIST ? d->nprims * 3 : d->prim == D3DPT_LINELIST ? d->nprims * 2 :
                              d->prim == D3DPT_POINTLIST ? d->nprims : d->prim == D3DPT_LINESTRIP ? d->nprims + 1 : d->nprims + 2) : 0;
     d3d9_buffer *vb = d3d9.vb, *ib = d3d9.ib;
     int streamed = d->user_verts != NULL || (vb->usage & D3DUSAGE_DYNAMIC) || vb->pool == D3DPOOL_SYSTEMMEM;
-    const uint8_t *base;
     int first_vertex = d->indexed ? d->base + d->min_vertex : d->first;
     if (d->indexed && !d->user_index && !ib) return;
+    if (g_census_frame && (d3d9.frame + 1) % g_census_frame == 0) census_draw(d, p, k.mode, gltex, streamed);
+    GLuint abuf;                               /* the buffer the arrays read */
+    size_t abase;                              /* where its vertex 0 is */
+    int first;                                 /* the first vertex of this draw, or what an index of 0 means */
     if (streamed) {
         const uint8_t *src = d->user_verts ? d->user_verts + (size_t)(d->indexed ? d->min_vertex : 0) * (size_t)stride
                                            : (const uint8_t *)G2H(vb->data) + d3d9.vb_offset + (size_t)first_vertex * (size_t)stride;
         size_t bytes = (size_t)d->num_vertices * (size_t)stride;
         if (!d->user_verts && d3d9.vb_offset + (size_t)(first_vertex + d->num_vertices) * (size_t)stride > (size_t)vb->size) return;
-        glBindBuffer(GL_ARRAY_BUFFER, g_stream_vb);
-        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)bytes, src, GL_STREAM_DRAW);
-        base = NULL;
+        if (g_cur_vb != g_stream_vb) glBindBuffer(GL_ARRAY_BUFFER, g_stream_vb), g_cur_vb = g_stream_vb;
+        abuf = g_stream_vb, abase = 0;
+        first = (int)(stream_put(&g_vstream, src, bytes, (size_t)stride) / (size_t)stride);
     } else {
         if (!vb->gl) glGenBuffers(1, &vb->gl), vb->dirty = 1;
-        glBindBuffer(GL_ARRAY_BUFFER, vb->gl);
+        if (g_cur_vb != vb->gl) glBindBuffer(GL_ARRAY_BUFFER, vb->gl), g_cur_vb = vb->gl;
         if (vb->dirty) glBufferData(GL_ARRAY_BUFFER, vb->size, G2H(vb->data), GL_STATIC_DRAW), vb->dirty = 0;
-        base = (const uint8_t *)(uintptr_t)(d3d9.vb_offset + (size_t)(d->indexed ? d->base : d->first) * (size_t)stride);
+        abuf = vb->gl;
+        if (d->indexed) abase = d3d9.vb_offset + (size_t)d->base * (size_t)stride, first = 0;     /* its indices count from there */
+        else abase = d3d9.vb_offset, first = d->first;
     }
-    unsigned want = 0;
-    if (k.mode == MODE_SHADER) {
-        for (unsigned i = 0; i < 16; i++) {
-            const elem *e = vs->info.in[i].declared ? find_elem(el, nel, vs->info.in[i].usage, vs->info.in[i].usage_index) : NULL;
-            if (e) set_array(i, e, stride, base), want |= 1u << i;
-        }
-    } else {
-        const elem *a[5] = { e_post ? e_post : e_pos, e_n, e_d0, e_d1, e_t0 };
-        for (unsigned i = 0; i < 5; i++) if (a[i]) set_array(i, a[i], stride, base), want |= 1u << i;
+    if (g_arr_buf != abuf || g_arr_base != abase || g_arr_stride != stride || g_arr_sig != lay->sig) {
+        for (unsigned i = 0; i < 16; i++) if (lay->arr[i]) set_array(i, lay->arr[i], stride, (const uint8_t *)abase);
+        g_arr_buf = abuf, g_arr_base = abase, g_arr_stride = stride, g_arr_sig = lay->sig;
     }
-    enable_arrays(want);
+    enable_arrays(lay->want);
 
+    PHASE(3);
     DOING("the draw call");
     if (!d->indexed) {
-        glDrawArrays(mode[d->prim], 0, d->num_vertices);
+        glDrawArrays(mode[d->prim], first, d->num_vertices);
     } else if (streamed || d->user_index || (ib->usage & D3DUSAGE_DYNAMIC) || ib->pool == D3DPOOL_SYSTEMMEM) {
+        /* The indices are sent with the draw too: as 32-bit ones, each moved
+         * to where this draw's vertices are in the stream. */
         int bytes = d->user_index ? d->index_bytes : ib->fmt == D3DFMT_INDEX32 ? 4 : 2;
         const uint8_t *src = d->user_index ? d->user_index : (const uint8_t *)G2H(ib->data) + (size_t)d->first * (size_t)bytes;
-        int rebase = streamed ? d->min_vertex : 0;
+        uint32_t move = (uint32_t)first - (uint32_t)(streamed ? d->min_vertex : 0);
         if (!d->user_index && (size_t)(d->first + nidx) * (size_t)bytes > (size_t)ib->size) return;
-        uint8_t *tmp = scratch((size_t)nidx * 4);
+        uint32_t *tmp = (uint32_t *)(void *)scratch((size_t)nidx * 4);
         if (!tmp) return;
-        if (bytes == 2) for (int i = 0; i < nidx; i++) { uint16_t v; memcpy(&v, src + 2 * i, 2); v = (uint16_t)(v - rebase); memcpy(tmp + 2 * i, &v, 2); }
-        else for (int i = 0; i < nidx; i++) { uint32_t v; memcpy(&v, src + 4 * i, 4); v -= (uint32_t)rebase; memcpy(tmp + 4 * i, &v, 4); }
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_stream_ib);
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)nidx * bytes, tmp, GL_STREAM_DRAW);
-        glDrawElements(mode[d->prim], nidx, bytes == 2 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT, NULL);
+        if (bytes == 2) for (int i = 0; i < nidx; i++) { uint16_t v; memcpy(&v, src + 2 * i, 2); tmp[i] = (uint32_t)v + move; }
+        else for (int i = 0; i < nidx; i++) { uint32_t v; memcpy(&v, src + 4 * i, 4); tmp[i] = v + move; }
+        if (g_cur_ib != g_stream_ib) glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_stream_ib), g_cur_ib = g_stream_ib;
+        size_t at = stream_put(&g_istream, tmp, (size_t)nidx * 4, 4);
+        glDrawElements(mode[d->prim], nidx, GL_UNSIGNED_INT, (const void *)(uintptr_t)at);
     } else {
         int bytes = ib->fmt == D3DFMT_INDEX32 ? 4 : 2;
         if (!ib->gl) glGenBuffers(1, &ib->gl), ib->dirty = 1;
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ib->gl);
+        if (g_cur_ib != ib->gl) glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ib->gl), g_cur_ib = ib->gl;
         if (ib->dirty) glBufferData(GL_ELEMENT_ARRAY_BUFFER, ib->size, G2H(ib->data), GL_STATIC_DRAW), ib->dirty = 0;
         glDrawElements(mode[d->prim], nidx, bytes == 2 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT, (const void *)(uintptr_t)((size_t)d->first * (size_t)bytes));
     }
+    PHASE(4);
     g_draws++;
     DOING("nothing");
 }
+#undef PHASE
 
 /* ---- the picture, shown and saved --------------------------------------------------- */
 void d3d9_gl_present(void) {
     if (!gl_enter()) return;
     pointer_due();
+    uint64_t t0 = hle_now_ns(), t1;
+    state_forget();
+    if (g_census.n) census_say();
     DOING("presenting");
     if (g_win) {
         int ww, wh;
@@ -1000,9 +1234,13 @@ void d3d9_gl_present(void) {
         glClearColor(0, 0, 0, 1);
         glClear(GL_COLOR_BUFFER_BIT);
         glBlitFramebuffer(0, 0, d3d9.w, d3d9.h, x, y + h, x + w, y, GL_COLOR_BUFFER_BIT, GL_LINEAR);   /* turned the right way up */
+        if (hle_d3d9_vsync != g_swap_interval) SDL_GL_SetSwapInterval(hle_d3d9_vsync), g_swap_interval = hle_d3d9_vsync;
+        t1 = hle_now_ns();
         SDL_GL_SwapWindow(g_win);
+        hle_perf.swap_ns += hle_now_ns() - t1;
         pump();
     } else glFlush();
+    hle_perf.present_ns += hle_now_ns() - t0;
     DOING("nothing");
 }
 
@@ -1052,6 +1290,7 @@ int hle_d3d9_show_picture(const uint8_t *rgba, int w, int h) {
     glColorMask(1, 1, 1, 1);
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
+    state_forget();
     glUseProgram(program), g_cur_prog = program;
     /* the back buffer's first row is the picture's top, and so is the texture's */
     glUniform4f(u_rect, (float)((d3d9.w - dw) / 2) / (float)d3d9.w, (float)((d3d9.h - dh) / 2) / (float)d3d9.h,

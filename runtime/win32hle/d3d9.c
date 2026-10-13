@@ -898,6 +898,7 @@ static void dv_GetVertexShader(void) {
 static void dv_SetVertexShaderConstantF(void) { /* (this, first register, floats, registers) */
     if (A32(1) + A32(3) > 256 || !A32(2)) RET(D3DERR_INVALIDCALL, 4);
     memcpy(d3d9.vsc[A32(1)], G2H(A32(2)), 16u * (size_t)A32(3));
+    d3d9.vsc_serial++;
     RET(D3D_OK, 4);
 }
 static void dv_GetVertexShaderConstantF(void) {

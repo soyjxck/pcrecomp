@@ -300,9 +300,29 @@ extern const win32hle_shim win32hle_d3d9[];           /* Direct3DCreate9 */
 extern const win32hle_shim win32hle_d3dx9[];          /* d3dx9_NN: maths, textures from files, the shader assembler */
 extern int         hle_d3d9_headless;
 extern int         hle_d3d9_log;                      /* say what is drawn into, through which viewport, and what is read back */
-extern int         hle_d3d9_vsync;                    /* wait for the display at each Present */
+extern int         hle_d3d9_vsync;                    /* wait for the display at each Present: 1, or for every 2nd refresh, 3rd...; */
+                                                      /* a host may change it as it goes, and the next Present waits so */
 extern const char *hle_d3d9_title;
 extern void      (*hle_d3d9_frame_hook)(unsigned frame);   /* after each Present, counted from 1 */
+/* Where time went, for a host that wants to say why its frames are long:
+ * nanoseconds in draw calls (state, buffers and the call itself), of that
+ * in making programs and in filling textures; in clears; in Present, of
+ * that in the swap; and in ReadFile. The wait for the display is in one of
+ * them, whichever the driver waits in: the swap, or the first thing drawn
+ * after it, which is a frame's clear. hle_perf_take hands over what has
+ * gathered since it was last called. */
+typedef struct {
+    uint64_t draw_ns, program_ns, texture_ns, clear_ns, present_ns, swap_ns, read_ns, read_bytes;
+    unsigned draws, programs, textures, reads;
+    /* with hle_perf_phases set, a draw's time by what it was doing: finding
+     * its program and texture, setting state, uniforms, vertices, the call */
+    uint64_t phase_ns[5];
+} hle_perf_t;
+extern hle_perf_t hle_perf;
+extern int        hle_perf_on;      /* a host sets it to have draws timed (their count is kept anyway) */
+extern int        hle_perf_phases;
+uint64_t      hle_now_ns(void);
+void          hle_perf_take(hle_perf_t *out);
 void          hle_d3d9_desktop(int w, int h);         /* the display mode the guest is told the desktop has */
 int           hle_d3d9_save_png(const char *path);    /* the back buffer: 0 if written */
 /* A host's own picture (w by h of R, G, B, A, top row first) shown in place of

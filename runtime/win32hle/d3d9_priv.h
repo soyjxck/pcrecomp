@@ -154,6 +154,7 @@ typedef struct {
     d3d9_surface *rt, *ds;      /* what is drawn into */
     d3d9_surface *back, *back_ds;
     unsigned frame;             /* Presents so far */
+    unsigned vsc_serial;        /* goes up whenever a vertex shader constant is set */
 } d3d9_state;
 extern d3d9_state d3d9;
 

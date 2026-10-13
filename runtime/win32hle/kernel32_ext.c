@@ -139,18 +139,34 @@ static void k_CreateFileA(void) {
     RET(new_file(fd), 7);
 }
 
+/* Where time went (win32hle.h). The counters are plain: a line in a log
+ * every few seconds does not need them exact across threads. */
+hle_perf_t hle_perf;
+int hle_perf_on, hle_perf_phases;
+uint64_t hle_now_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+void hle_perf_take(hle_perf_t *out) {
+    *out = hle_perf;
+    memset(&hle_perf, 0, sizeof hle_perf);
+}
+
 static void k_ReadFile(void) {                           /* (h,buf,n,&read,ovl) */
     int fd = fd_of(A32(0));
     uint8_t *buf = (uint8_t *)APTR(1);
     uint32_t n = A32(2), *pr = (uint32_t *)APTR(3), got = 0;
     if (pr) *pr = 0;
     if (fd < 0) { hle_set_last_error(ERROR_INVALID_HANDLE); RET(0, 5); }
+    uint64_t t0 = hle_now_ns();
     while (got < n) {
         ssize_t r = read(fd, buf + got, n - got);
         if (r < 0 && errno == EINTR) continue;
         if (r <= 0) break;
         got += (uint32_t)r;
     }
+    hle_perf.read_ns += hle_now_ns() - t0, hle_perf.read_bytes += got, hle_perf.reads++;
     if (pr) *pr = got;
     RET(1, 5);                                           /* EOF is success with 0 read */
 }
