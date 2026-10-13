@@ -181,8 +181,10 @@ void hle_yield(void) {
 #ifdef __SWITCH__
 uint32_t svcSetThreadCoreMask(uint32_t handle, int32_t preferred_core, uint32_t affinity_mask);
 #define CUR_THREAD 0xFFFF8000u
-void hle_thread_aside(void) { svcSetThreadCoreMask(CUR_THREAD, 1, 1u << 1 | 1u << 2); }
+int hle_threads_aside = 1;
+void hle_thread_aside(void) { if (hle_threads_aside) svcSetThreadCoreMask(CUR_THREAD, 1, 1u << 1 | 1u << 2); }
 #else
+int hle_threads_aside = 1;
 void hle_thread_aside(void) {}
 #endif
 

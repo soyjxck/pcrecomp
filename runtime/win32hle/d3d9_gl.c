@@ -46,6 +46,7 @@ const char *hle_d3d9_title = "Direct3D";
 const char *volatile hle_d3d9_doing = "nothing";       /* what the drawing half is in the middle of, for a watchdog */
 #define DOING(what) (hle_d3d9_doing = (what))
 int hle_d3d9_vsync;
+int hle_d3d9_stream = 1, hle_d3d9_plain, hle_d3d9_watch_picture;
 static int g_swap_interval = -1;               /* what the window was last told of hle_d3d9_vsync */
 
 static SDL_Window *g_win;
@@ -119,6 +120,7 @@ static int gl_enter(void) {
         if (g_owned) {
             static int said;
             if (!said++) fprintf(stderr, "[d3d9] the thread that draws did not let go (under sub_%08X): drawing skipped\n", g_cur_func);
+            hle_perf.skipped++;
             return 0;
         }
         make_current(1);
@@ -956,6 +958,12 @@ static void enable_arrays(unsigned want) {
 typedef struct { GLenum target; size_t room, cap, at; } stream;
 static stream g_vstream = { GL_ARRAY_BUFFER, 4u << 20, 0, 0 }, g_istream = { GL_ELEMENT_ARRAY_BUFFER, 1u << 20, 0, 0 };
 static size_t stream_put(stream *st, const void *src, size_t n, size_t align) {
+    if (!hle_d3d9_stream) {                    /* a buffer of its own for every draw, and its arrays said again */
+        glBufferData(st->target, (GLsizeiptr)n, src, GL_STREAM_DRAW);
+        st->cap = st->at = 0;
+        if (st->target == GL_ARRAY_BUFFER) g_arr_buf = 0;
+        return 0;
+    }
     size_t at = (st->at + align - 1) / align * align;
     if (!st->cap || at + n > st->cap) {
         st->cap = n > st->room ? n : st->room;
@@ -1082,6 +1090,7 @@ static void draw_one(const d3d9_draw *d) {
     uint64_t tp = hle_perf_phases ? hle_now_ns() : 0;
     const uint32_t *rs = d3d9.rs;
     if (!gl_enter() || d->prim < 1 || d->prim > 6) return;
+    if (hle_d3d9_plain) state_forget(), g_arr_buf = 0, g_cur_vb = g_cur_ib = 0, g_cur_prog = 0;      /* nothing taken as said */
 
     /* what a vertex is made of */
     d3d9_vshader *vs = d3d9.vs;
@@ -1126,6 +1135,7 @@ static void draw_one(const d3d9_draw *d) {
     DOING("finding the program");
     prog *p = program_for(&k, vs);
     if (!p || !p->id) return;
+    if (hle_d3d9_plain) p->sent = 0, p->consts = 0;
 
     DOING("filling a texture");
     GLuint gltex = k.sample ? sampled_texture(tex) : 0;      /* before the state: making one may disturb it */
@@ -1274,6 +1284,32 @@ static void draw_one(const d3d9_draw *d) {
 #undef PHASE
 
 /* ---- the picture, shown and saved --------------------------------------------------- */
+/* hle_d3d9_watch_picture: three small pieces of a frame, down its left side
+ * (where an emulator that reads back only part of a row still reads), read
+ * from the framebuffer bound for reading, w by h: the game's own buffer
+ * (where 0) before it is shown, and the window's (1) after it has been
+ * copied there. A line in the log when one turns all black and when it stops
+ * being: a console has no one to look at its screen but the player, and
+ * which of the two went black says whether the drawing failed or the
+ * showing. */
+static void picture_watch(int where, int w, int h) {
+    static int was[2] = { -1, -1 };
+    static unsigned since[2];
+    uint8_t px[8 * 8 * 4];
+    int black = 1;
+    for (int i = 0; i < 3; i++) {
+        memset(px, 0, sizeof px);
+        glReadPixels(w / 8, h * (i + 1) / 4, 8, 8, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        for (int k = 0; k < 8 * 8; k++) if (px[4 * k] > 12 || px[4 * k + 1] > 12 || px[4 * k + 2] > 12) black = 0;
+    }
+    if (black != was[where]) {
+        if (was[where] >= 0 || black)
+            fprintf(stderr, "[d3d9] frame %u: %s %s (%lu draws so far; it had been %s for %u frames)\n", d3d9.frame,
+                    where ? "the window's picture" : "the game's picture", black ? "is black" : "is a picture again", g_draws,
+                    black ? "a picture" : "black", d3d9.frame - since[where]);
+        was[where] = black, since[where] = d3d9.frame;
+    }
+}
 void d3d9_gl_present(void) {
     if (!gl_enter()) return;
     pointer_due();
@@ -1281,6 +1317,13 @@ void d3d9_gl_present(void) {
     state_forget();
     if (g_census.n) census_say();
     DOING("presenting");
+    {
+        static int said;
+        GLenum e = glGetError();               /* nothing here asks GL for what it may refuse: one of these is a fault */
+        if (e != GL_NO_ERROR && said < 24) said++, fprintf(stderr, "[d3d9] frame %u: GL error 0x%04X\n", d3d9.frame, (unsigned)e);
+    }
+    int watch = hle_d3d9_watch_picture > 0 && d3d9.frame % (unsigned)hle_d3d9_watch_picture == 0;
+    if (watch) bind_fbo(fbo_for(d3d9.back, NULL)), picture_watch(0, d3d9.w, d3d9.h);
     if (g_win) {
         int ww, wh;
         SDL_GL_GetDrawableSize(g_win, &ww, &wh);
@@ -1295,6 +1338,7 @@ void d3d9_gl_present(void) {
         glClearColor(0, 0, 0, 1);
         glClear(GL_COLOR_BUFFER_BIT);
         glBlitFramebuffer(0, 0, d3d9.w, d3d9.h, x, y + h, x + w, y, GL_COLOR_BUFFER_BIT, GL_LINEAR);   /* turned the right way up */
+        if (watch) glBindFramebuffer(GL_READ_FRAMEBUFFER, 0), picture_watch(1, ww, wh);
         if (hle_d3d9_vsync != g_swap_interval) SDL_GL_SetSwapInterval(hle_d3d9_vsync), g_swap_interval = hle_d3d9_vsync;
         t1 = hle_now_ns();
         SDL_GL_SwapWindow(g_win);

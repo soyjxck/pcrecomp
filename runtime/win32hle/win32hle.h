@@ -139,6 +139,7 @@ void  hle_yield(void);
  * first one, not in turns with it (host_lite.c; nothing where the system
  * spreads threads over the cores by itself). */
 void  hle_thread_aside(void);
+extern int hle_threads_aside;      /* 0: they stay where the system starts them */
 /* Called on a thread about to give the machine up, for a wait (1) or for
  * another thread's turn (0): for what a host keeps bound to the thread that
  * runs the guest, such as a graphics context. */
@@ -312,6 +313,14 @@ extern int         hle_d3d9_headless;
 extern int         hle_d3d9_log;                      /* say what is drawn into, through which viewport, and what is read back */
 extern int         hle_d3d9_vsync;                    /* wait for the display at each Present: 1, or for every 2nd refresh, 3rd...; */
                                                       /* a host may change it as it goes, and the next Present waits so */
+/* The short cuts of the drawing half, each of which a host may switch off
+ * (to tell which of them a machine does not take): vertices that come with a
+ * draw going into one stream (0: a buffer of its own for every draw); and a
+ * draw sending only what has changed (hle_d3d9_plain 1: everything, every
+ * time). hle_d3d9_watch_picture N has every Nth frame looked at, in the
+ * game's own buffer and again in the window's once it has been copied there,
+ * and the log told when either turns black and when it is a picture again. */
+extern int         hle_d3d9_stream, hle_d3d9_plain, hle_d3d9_watch_picture;
 extern const char *hle_d3d9_title;
 extern void      (*hle_d3d9_frame_hook)(unsigned frame);   /* after each Present, counted from 1 */
 /* Where time went, for a host that wants to say why its frames are long:
@@ -324,6 +333,7 @@ extern void      (*hle_d3d9_frame_hook)(unsigned frame);   /* after each Present
 typedef struct {
     uint64_t draw_ns, program_ns, texture_ns, clear_ns, present_ns, swap_ns, read_ns, read_bytes;
     unsigned draws, programs, textures, reads;
+    unsigned skipped;               /* draws, clears and presents not done: another thread kept the context */
     /* with hle_perf_phases set, a draw's time by what it was doing: finding
      * its program and texture, setting state, uniforms, vertices, the call */
     uint64_t phase_ns[5];
