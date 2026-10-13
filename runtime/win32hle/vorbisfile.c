@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include "win32hle.h"
 
 #ifdef HLE_WITH_LIBVORBIS
@@ -53,6 +54,7 @@ typedef struct {
     int channels, rate;
     uint32_t datasource, close_fn;
     uint32_t info, comment;     /* what ov_info and ov_comment hand out, in guest memory */
+    volatile int busy;          /* being decoded, by a thread that has given the machine up (ov_read_) */
 #ifdef HLE_WITH_LIBVORBIS
     OggVorbis_File ov;
 #else
@@ -158,7 +160,13 @@ static stream *find(uint32_t vf) {
     for (int i = 0; vf && i < MAX_STREAMS; i++) if (g_stream[i].vf == vf) return &g_stream[i];
     return NULL;
 }
+/* Whoever would close a stream or move in it waits for a decoder that is in
+ * the middle of it to come back. */
+static void settle(stream *s) {
+    while (s->busy) { hle_block_begin(); usleep(200); hle_block_end(); }
+}
 static void drop(stream *s, int opened) {
+    settle(s);
     if (opened) dec_close(s);
     free(s->file);
     if (s->info) hle_guest_free(s->info);
@@ -235,6 +243,7 @@ static void ov_pcm_total_(void) {              /* (&file, link): samples of one 
 static void ov_pcm_seek_(void) {               /* (&file, the sample as 64 bits) */
     stream *s = find(A32(0));
     if (!s) RET(GUEST_OV_EINVAL, 0);
+    settle(s);
     dec_seek(s, A32(1));
     RET(0, 0);
 }
@@ -242,13 +251,28 @@ static void ov_info_(void) { stream *s = find(A32(0)); RET(s ? s->info : 0, 0); 
 static void ov_comment_(void) { stream *s = find(A32(0)); RET(s ? s->comment : 0, 0); }
 /* (&file, to, bytes, big endian, bytes a sample, signed, &which stream): bytes
  * written, 0 at the end. Signed 16-bit in this machine's order is all that is
- * asked for. */
+ * asked for.
+ *
+ * The machine is given up while the decoder works: it reads the host's copy
+ * of the stream and writes the caller's own buffer, nothing the guest shares.
+ * Decoding is the one long piece of work a music thread does, in a burst
+ * whenever its buffer has run half empty, and with the machine held the
+ * game's own thread stood still for the whole of each burst: a frame lost
+ * every time, on a processor slow enough for a burst to outlast one. */
 static void ov_read_(void) {
     stream *s = find(A32(0));
-    if (!s || !A32(1)) RET(GUEST_OV_EINVAL, 0);
+    uint32_t to = A32(1);
+    int bytes = (int)A32(2);
+    if (!s || !to) RET(GUEST_OV_EINVAL, 0);
     if (A32(4) != 2 || A32(3)) { static int said; if (!said++) fprintf(stderr, "[vorbisfile] not done: samples other than 16-bit little-endian\n"); }
     if (A32(6)) MEM32(A32(6)) = 0;
-    RET((uint32_t)dec_read(s, G2H(A32(1)), (int)A32(2)), 0);
+    settle(s);
+    s->busy = 1;
+    hle_block_begin();
+    long n = dec_read(s, G2H(to), bytes);
+    hle_block_end();
+    s->busy = 0;
+    RET((uint32_t)n, 0);
 }
 
 const win32hle_shim win32hle_vorbisfile[] = {
