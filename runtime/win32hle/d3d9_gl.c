@@ -60,7 +60,7 @@ static int g_owned;                            /* the context is some thread's: 
 static volatile int g_wanted;                  /* another thread is waiting for it */
 static int g_have_aniso, g_max_tex = 4096, g_trace;
 static unsigned g_census_frame;                /* HLE_D3D9_CENSUS: every so many frames, one whose draws are counted */
-static int g_fills_said = 400;                 /* HLE_D3D9_FILLS: texture fills written to the log so far */
+static int g_fills_said = 4000;                /* HLE_D3D9_FILLS=N: fills written to the log so far; below 0, still to pass over */
 static GLuint g_vao, g_stream_vb, g_stream_ib;
 static GLuint g_cur_fbo = ~0u, g_cur_prog, g_cur_tex = ~0u;
 static GLuint g_cur_vb, g_cur_ib;              /* the buffers bound for vertices and for indices */
@@ -336,7 +336,7 @@ int d3d9_gl_open(int w, int h, int headless) {
     g_have_aniso = ext && strstr(ext, "texture_filter_anisotropic");
     g_trace = getenv("HLE_D3D9_TRACE") != NULL;
     if (getenv("HLE_D3D9_CENSUS")) g_census_frame = (unsigned)atoi(getenv("HLE_D3D9_CENSUS"));
-    if (getenv("HLE_D3D9_FILLS")) g_fills_said = 0;
+    if (getenv("HLE_D3D9_FILLS")) g_fills_said = -atoi(getenv("HLE_D3D9_FILLS"));
     glGetIntegerv(GL_MAX_TEXTURE_SIZE, &g_max_tex);
     fprintf(stderr, "[d3d9] %s, %s (%s)\n", (const char *)glGetString(GL_VERSION), (const char *)glGetString(GL_RENDERER),
             headless ? "no window" : "window");
@@ -437,10 +437,9 @@ static GLuint texture_ready(d3d9_texture *t) {
         t->gl_min = t->gl_mag = t->gl_u = t->gl_v = -1, t->gl_aniso = 1;
     }
     if (!fresh && !t->dirty) return t->gl;
-    if (g_fills_said < 400) {                  /* HLE_D3D9_FILLS: what the first four hundred fills are of */
+    if (g_fills_said < 4000 && g_fills_said++ >= 0) {      /* HLE_D3D9_FILLS=N: what four thousand fills are of, after the first N */
         int levels = 0;
         for (int i = 0; i < t->levels; i++) levels += fresh || t->level[i]->dirty;
-        g_fills_said++;
         fprintf(stderr, "[d3d9] frame %u: a texture filled %s: %dx%d, format %d, %d of %d levels (under sub_%08X)\n", d3d9.frame,
                 fresh ? "for the first time" : "again", t->level[0]->w, t->level[0]->h, t->level[0]->fmt, levels, t->levels, g_cur_func);
     }
@@ -1308,14 +1307,23 @@ static void draw_one(const d3d9_draw *d) {
  * which of the two went black says whether the drawing failed or the
  * showing. */
 static void picture_watch(int where, int w, int h) {
-    static int was[2] = { -1, -1 };
+    static int was[2] = { -1, -1 }, bright[2] = { -1, -1 };
     static unsigned since[2];
     uint8_t px[8 * 8 * 4];
-    int black = 1;
-    for (int i = 0; i < 3; i++) {
+    int black = 1, sum = 0, parts[5];
+    /* five pieces: three down the left, the middle of the picture, and the right */
+    static const int at[5][2] = { { 1, 2 }, { 1, 4 }, { 1, 6 }, { 4, 4 }, { 7, 4 } };      /* in eighths of w and of h */
+    for (int i = 0; i < 5; i++) {
+        int most = 0;
         memset(px, 0, sizeof px);
-        glReadPixels(w / 8, h * (i + 1) / 4, 8, 8, GL_RGBA, GL_UNSIGNED_BYTE, px);
-        for (int k = 0; k < 8 * 8; k++) if (px[4 * k] > 12 || px[4 * k + 1] > 12 || px[4 * k + 2] > 12) black = 0;
+        glReadPixels(w * at[i][0] / 8, h * at[i][1] / 8, 8, 8, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        for (int k = 0; k < 8 * 8; k++) {
+            int m = px[4 * k] > px[4 * k + 1] ? px[4 * k] : px[4 * k + 1];
+            if (px[4 * k + 2] > m) m = px[4 * k + 2];
+            if (m > most) most = m;
+        }
+        if (most > 12) black = 0;
+        parts[i] = most, sum += most;
     }
     if (black != was[where]) {
         if (was[where] >= 0 || black)
@@ -1323,6 +1331,12 @@ static void picture_watch(int where, int w, int h) {
                     where ? "the window's picture" : "the game's picture", black ? "is black" : "is a picture again", g_draws,
                     black ? "a picture" : "black", d3d9.frame - since[where]);
         was[where] = black, since[where] = d3d9.frame;
+    }
+    /* and how bright: the brightest of each piece, said when their sum has moved by a tenth of full */
+    if (bright[where] < 0 || sum - bright[where] > 127 || bright[where] - sum > 127) {
+        fprintf(stderr, "[d3d9] frame %u: %s is as bright as %d %d %d, %d, %d of 255 (left top, middle, bottom; the middle; the right)\n",
+                d3d9.frame, where ? "the window's picture" : "the game's picture", parts[0], parts[1], parts[2], parts[3], parts[4]);
+        bright[where] = sum;
     }
 }
 void d3d9_gl_present(void) {
