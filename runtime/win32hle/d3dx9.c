@@ -25,8 +25,8 @@ const win32hle_shim win32hle_d3dx9[] = { { NULL, NULL } };
 #define D3DXFERR_FILENOTFOUND 0x88760389u
 #define D3DX_DEFAULT 0xFFFFFFFFu
 
-static float AF(int i) { uint32_t u = A32(i); float f; memcpy(&f, &u, 4); return f; }
-static const float *FP(int i) { return (const float *)G2H(A32(i)); }
+static inline float AF(int i) { uint32_t u = A32(i); float f; memcpy(&f, &u, 4); return f; }
+static inline const float *FP(int i) { return (const float *)G2H(A32(i)); }
 static void once(const char *what) {
     static const char *said[32];
     static int n;
@@ -37,6 +37,21 @@ static void once(const char *what) {
 
 /* ---- maths: vectors on the left, matrices in rows, as Direct3D has them ---------- */
 static void m_identity(float *m) { memset(m, 0, 64); m[0] = m[5] = m[10] = m[15] = 1.0f; }
+/* A game multiplies matrices by the thousand a frame: on arm64 a row of the
+ * product at a time (the same sums in the same order as below). */
+#if defined(__aarch64__)
+#include <arm_neon.h>
+static void m_mul(float *r, const float *a, const float *b) {
+    float32x4_t b0 = vld1q_f32(b), b1 = vld1q_f32(b + 4), b2 = vld1q_f32(b + 8), b3 = vld1q_f32(b + 12), t[4];
+    for (int i = 0; i < 4; i++) {
+        float32x4_t row = vmulq_n_f32(b0, a[i * 4]);
+        row = vaddq_f32(row, vmulq_n_f32(b1, a[i * 4 + 1]));
+        row = vaddq_f32(row, vmulq_n_f32(b2, a[i * 4 + 2]));
+        t[i] = vaddq_f32(row, vmulq_n_f32(b3, a[i * 4 + 3]));
+    }
+    for (int i = 0; i < 4; i++) vst1q_f32(r + i * 4, t[i]);       /* after the last read: r may be a or b */
+}
+#else
 static void m_mul(float *r, const float *a, const float *b) {
     float t[16];
     for (int i = 0; i < 4; i++)
@@ -44,6 +59,7 @@ static void m_mul(float *r, const float *a, const float *b) {
             t[i * 4 + j] = a[i * 4] * b[j] + a[i * 4 + 1] * b[4 + j] + a[i * 4 + 2] * b[8 + j] + a[i * 4 + 3] * b[12 + j];
     memcpy(r, t, 64);
 }
+#endif
 static int m_inverse(float *r, const float *m, float *det_out) {
     float inv[16], det;
     inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];

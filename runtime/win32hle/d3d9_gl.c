@@ -59,6 +59,7 @@ static int g_owned;                            /* the context is some thread's: 
 static volatile int g_wanted;                  /* another thread is waiting for it */
 static int g_have_aniso, g_max_tex = 4096, g_trace;
 static unsigned g_census_frame;                /* HLE_D3D9_CENSUS: every so many frames, one whose draws are counted */
+static int g_fills_said = 400;                 /* HLE_D3D9_FILLS: texture fills written to the log so far */
 static GLuint g_vao, g_stream_vb, g_stream_ib;
 static GLuint g_cur_fbo = ~0u, g_cur_prog, g_cur_tex = ~0u;
 static GLuint g_cur_vb, g_cur_ib;              /* the buffers bound for vertices and for indices */
@@ -333,6 +334,7 @@ int d3d9_gl_open(int w, int h, int headless) {
     g_have_aniso = ext && strstr(ext, "texture_filter_anisotropic");
     g_trace = getenv("HLE_D3D9_TRACE") != NULL;
     if (getenv("HLE_D3D9_CENSUS")) g_census_frame = (unsigned)atoi(getenv("HLE_D3D9_CENSUS"));
+    if (getenv("HLE_D3D9_FILLS")) g_fills_said = 0;
     glGetIntegerv(GL_MAX_TEXTURE_SIZE, &g_max_tex);
     fprintf(stderr, "[d3d9] %s, %s (%s)\n", (const char *)glGetString(GL_VERSION), (const char *)glGetString(GL_RENDERER),
             headless ? "no window" : "window");
@@ -364,6 +366,59 @@ static uint8_t *scratch(size_t n) {
 }
 static void swap_rb(uint8_t *px, size_t n) { for (size_t i = 0; i < n; i++, px += 4) { uint8_t t = px[0]; px[0] = px[2], px[2] = t; } }
 
+/* A row of a texture as GL takes it: R, G, B, A bytes. The formats a game's
+ * art is nearly all in go there in one pass (sixteen-bit pixels with four bits
+ * a channel are what a sprite sheet is, and a game that keeps a few dozen of
+ * them and refills them as its people turn about sends several a second);
+ * anything else by way of d3d9_to_bgra. */
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+static void row_to_rgba(int fmt, const uint8_t *src, uint8_t *o, int n) {
+    int i = 0;
+    switch (fmt) {
+    case D3DFMT_A4R4G4B4: case D3DFMT_X4R4G4B4:
+#if defined(__aarch64__)
+        for (; i + 8 <= n; i += 8) {
+            uint16x8_t v = vreinterpretq_u16_u8(vld1q_u8(src + 2 * i)), low = vdupq_n_u16(15);
+            uint8x8_t k = vdup_n_u8(17);
+            uint8x8x4_t px;
+            px.val[0] = vmul_u8(vmovn_u16(vandq_u16(vshrq_n_u16(v, 8), low)), k);
+            px.val[1] = vmul_u8(vmovn_u16(vandq_u16(vshrq_n_u16(v, 4), low)), k);
+            px.val[2] = vmul_u8(vmovn_u16(vandq_u16(v, low)), k);
+            px.val[3] = fmt == D3DFMT_X4R4G4B4 ? vdup_n_u8(255) : vmul_u8(vmovn_u16(vshrq_n_u16(v, 12)), k);
+            vst4_u8(o + 4 * i, px);
+        }
+#endif
+        for (; i < n; i++) {                   /* a nibble times 17 is the nibble twice: four of them at once, a byte apart */
+            uint16_t v;
+            memcpy(&v, src + 2 * i, 2);
+            uint32_t x = (uint32_t)(v >> 8 & 15) | (uint32_t)(v >> 4 & 15) << 8 | (uint32_t)(v & 15) << 16 | (uint32_t)(v >> 12) << 24;
+            x *= 17;
+            if (fmt == D3DFMT_X4R4G4B4) x |= 0xFF000000u;
+            o[4 * i] = (uint8_t)x, o[4 * i + 1] = (uint8_t)(x >> 8), o[4 * i + 2] = (uint8_t)(x >> 16), o[4 * i + 3] = (uint8_t)(x >> 24);
+        }
+        return;
+    case D3DFMT_A8R8G8B8: case D3DFMT_X8R8G8B8:
+#if defined(__aarch64__)
+        for (; i + 16 <= n; i += 16) {
+            uint8x16x4_t px = vld4q_u8(src + 4 * i);
+            uint8x16_t b = px.val[0];
+            px.val[0] = px.val[2], px.val[2] = b;
+            if (fmt == D3DFMT_X8R8G8B8) px.val[3] = vdupq_n_u8(255);
+            vst4q_u8(o + 4 * i, px);
+        }
+#endif
+        for (; i < n; i++) {
+            o[4 * i] = src[4 * i + 2], o[4 * i + 1] = src[4 * i + 1], o[4 * i + 2] = src[4 * i];
+            o[4 * i + 3] = fmt == D3DFMT_X8R8G8B8 ? 255 : src[4 * i + 3];
+        }
+        return;
+    }
+    d3d9_to_bgra(fmt, src, o, n);
+    swap_rb(o, (size_t)n);
+}
+
 static GLuint texture_ready(d3d9_texture *t);
 static GLuint sampled_texture(d3d9_texture *t) {         /* timed when there is something to fill */
     if (!(t->usage & D3DUSAGE_RENDERTARGET) && t->gl && !t->dirty) return t->gl;
@@ -380,6 +435,13 @@ static GLuint texture_ready(d3d9_texture *t) {
         t->gl_min = t->gl_mag = t->gl_u = t->gl_v = -1, t->gl_aniso = 1;
     }
     if (!fresh && !t->dirty) return t->gl;
+    if (g_fills_said < 400) {                  /* HLE_D3D9_FILLS: what the first four hundred fills are of */
+        int levels = 0;
+        for (int i = 0; i < t->levels; i++) levels += fresh || t->level[i]->dirty;
+        g_fills_said++;
+        fprintf(stderr, "[d3d9] frame %u: a texture filled %s: %dx%d, format %d, %d of %d levels (under sub_%08X)\n", d3d9.frame,
+                fresh ? "for the first time" : "again", t->level[0]->w, t->level[0]->h, t->level[0]->fmt, levels, t->levels, g_cur_func);
+    }
     bind_texture(t->gl);
     if (fresh) glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, t->levels - 1);
     for (int i = 0; i < t->levels; i++) {
@@ -388,8 +450,7 @@ static GLuint texture_ready(d3d9_texture *t) {
         uint8_t *px = NULL;
         if (s->bits && (px = scratch((size_t)s->w * (size_t)s->h * 4)) != NULL) {
             for (int r = 0; r < s->h; r++)
-                d3d9_to_bgra(s->fmt, (const uint8_t *)G2H(s->bits) + (size_t)r * (size_t)s->pitch, px + (size_t)r * (size_t)s->w * 4, s->w);
-            swap_rb(px, (size_t)s->w * (size_t)s->h);
+                row_to_rgba(s->fmt, (const uint8_t *)G2H(s->bits) + (size_t)r * (size_t)s->pitch, px + (size_t)r * (size_t)s->w * 4, s->w);
         }
         glTexImage2D(GL_TEXTURE_2D, i, GL_RGBA8, s->w, s->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
         s->dirty = 0;
