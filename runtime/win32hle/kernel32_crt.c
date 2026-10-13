@@ -32,6 +32,7 @@
 struct thread_arg { uint32_t start, param, tid; hle_thread_t *obj; };
 static void *thread_trampoline(void *p) {
     struct thread_arg a = *(struct thread_arg *)p; free(p);
+    hle_thread_aside();
     hle_thread_adopt_id(a.tid);
     uint32_t args[1] = { a.param };
     a.obj->code = hle_call_guest(a.start, 1, args);

@@ -170,10 +170,51 @@ void hle_yield(void) {
     hle_block_end();
 }
 
+/* On the Switch a thread stays on the core it was started on, and every
+ * thread is started on the core of the program's first: a music thread's
+ * decoder, the mixer and the timers all took their turns out of the game's
+ * own time, with two cores idle beside it. A thread that is not the first
+ * calls this as it starts, and is the other two cores' from then on. */
+#ifdef __SWITCH__
+uint32_t svcSetThreadCoreMask(uint32_t handle, int32_t preferred_core, uint32_t affinity_mask);
+#define CUR_THREAD 0xFFFF8000u
+void hle_thread_aside(void) { svcSetThreadCoreMask(CUR_THREAD, 1, 1u << 1 | 1u << 2); }
+#else
+void hle_thread_aside(void) {}
+#endif
+
 /* ------------------------------------------------------------- dispatch
  * recomp_lookup searches the generated dispatch table (declared extern in
- * recomp_types.h; defined by the lifted program, or the selftest). */
+ * recomp_types.h; defined by the lifted program, or the selftest).
+ *
+ * The table is laid out again as one small number for every byte of the
+ * lifted code's address range (a function's place in the table, plus one):
+ * an indirect call is then two loads, where the search is thirteen probes for
+ * 7,000 functions, and a game makes thousands of such calls a frame. It is
+ * made at the first lookup; not at all when the range is too wide for it or
+ * the functions too many, and then the search is used. */
+#define FLAT_MAX_SPAN (32u << 20)
+static uint16_t *g_flat;
+static uint32_t g_flat_lo, g_flat_span;
+static int g_flat_tried;
+static void dispatch_flatten(void) {
+    g_flat_tried = 1;
+    if (!recomp_dispatch_count || recomp_dispatch_count >= 0xFFFFu) return;
+    uint32_t lo = recomp_dispatch_table[0].address;
+    uint32_t span = recomp_dispatch_table[recomp_dispatch_count - 1].address - lo + 1;
+    if (span > FLAT_MAX_SPAN) return;
+    uint16_t *t = calloc(span, sizeof *t);
+    if (!t) return;
+    for (uint32_t i = 0; i < recomp_dispatch_count; i++)
+        if (recomp_dispatch_table[i].address - lo < span) t[recomp_dispatch_table[i].address - lo] = (uint16_t)(i + 1);
+    g_flat_lo = lo, g_flat_span = span, g_flat = t;
+}
 recomp_func_t recomp_lookup(uint32_t va) {
+    if (!g_flat_tried) dispatch_flatten();
+    if (g_flat) {
+        uint32_t at = va - g_flat_lo, i = at < g_flat_span ? g_flat[at] : 0;
+        return i ? recomp_dispatch_table[i - 1].func : NULL;
+    }
     uint32_t lo = 0, hi = recomp_dispatch_count;
     while (lo < hi) {
         uint32_t mid = lo + (hi - lo) / 2, m = recomp_dispatch_table[mid].address;
@@ -182,7 +223,6 @@ recomp_func_t recomp_lookup(uint32_t va) {
     }
     return NULL;
 }
-recomp_func_t recomp_lookup_manual(uint32_t va) { (void)va; return NULL; }
 
 /* --------------------------------------------------------- shim registry
  * Each shim gets a synthetic VA in a reserved range that no real image uses. */
@@ -222,11 +262,16 @@ static uint32_t g_last_import_va;
  * thread that holds the machine, so the index passes through a global. */
 static volatile uint32_t g_pending_shim;
 hle_thread_seen hle_threads[HLE_THREADS_SEEN];
+int hle_threads_watched;
 static void shim_entry(void) {
     uint32_t i = g_pending_shim;
-    static __thread int seat = -1;
-    static int seats;
-    if (seat < 0) seat = __sync_fetch_and_add(&seats, 1);
+    int seat = HLE_THREADS_SEEN;
+    if (hle_threads_watched) {                 /* a thread's own variable is a call to find, where there is no register for it */
+        static __thread int mine = -1;
+        static int seats;
+        if (mine < 0) mine = __sync_fetch_and_add(&seats, 1);
+        seat = mine;
+    }
     if (seat < HLE_THREADS_SEEN) {
         hle_thread_seen *t = &hle_threads[seat];
         t->shim = g_shim[i].name, t->from = g_cur_func, t->calls++, t->inside = 1;
@@ -254,6 +299,13 @@ recomp_func_t recomp_lookup_import(uint32_t va) {
         return shim_entry;
     }
     return NULL;
+}
+/* An indirect call asks this first, and here it is the whole answer: a
+ * shim's address is told by its range alone, and anything below it is lifted
+ * code or nothing. (What it does not know, the call asks the two above for
+ * again, and reports.) */
+recomp_func_t recomp_lookup_manual(uint32_t va) {
+    return va >= SHIM_BASE ? recomp_lookup_import(va) : recomp_lookup(va);
 }
 
 /* Permissive bind: unresolved imports bind here instead of failing. A stdcall

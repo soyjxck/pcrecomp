@@ -41,6 +41,7 @@ static struct { volatile int used, killed, inflight; uint32_t id, delay, proc, u
 static uint32_t g_mmt_next = 1;
 static void *mmtimer(void *arg) {
     int i = (int)(intptr_t)arg;
+    hle_thread_aside();
     uint32_t due = hle_ticks_ms() + g_mmt[i].delay;
     for (;;) {
         int32_t wait = (int32_t)(due - hle_ticks_ms());

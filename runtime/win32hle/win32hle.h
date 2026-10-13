@@ -46,7 +46,12 @@ typedef uint32_t win_handle;   /* HANDLE/HWND/HDC/HMODULE/HBITMAP... */
  * below 0x10000 pass through both ways (0 is NULL, a Win32 atom is an atom). */
 void    *hle_g2h(uint32_t va);
 uint32_t hle_h2g(const void *p);
-#define G2H(va) hle_g2h(va)
+/* In line: a shim turns a guest pointer into the host's for every argument
+ * that is one, some of them thousands of times a frame. (hle_g2h is the same
+ * and also makes the reservation if nothing has yet; a guest pointer worth
+ * following came out of memory that already did.) */
+static inline void *hle_g2h_inline(uint32_t va) { return va < 0x10000u ? (void *)(uintptr_t)va : (void *)ADDR(va); }
+#define G2H(va) hle_g2h_inline(va)
 #define H2G(p)  hle_h2g(p)
 int      hle_guest_init(void);                           /* the reservation; implied by the first use */
 uint32_t hle_guest_map(uint32_t va, uint32_t size);      /* memory at a fixed VA (an image): the VA, or 0 if taken */
@@ -109,6 +114,7 @@ const char *hle_name(uint32_t va);
 #define HLE_THREADS_SEEN 8
 typedef struct { const char *volatile shim; volatile uint32_t from; volatile unsigned long calls; volatile int inside; } hle_thread_seen;
 extern hle_thread_seen hle_threads[HLE_THREADS_SEEN];
+extern int hle_threads_watched;     /* a host sets it to have them kept: they cost every call out a little */
 
 /* ---- native -> guest ----
  * Run a lifted function (window proc, dialog proc, thread start, timer) from
@@ -129,6 +135,10 @@ void  hle_block_begin(void);
 void  hle_block_end(void);
 /* Inside a shim: hand the machine to a waiting thread, if any. */
 void  hle_yield(void);
+/* As a thread that is not the program's first starts: have it run beside the
+ * first one, not in turns with it (host_lite.c; nothing where the system
+ * spreads threads over the cores by itself). */
+void  hle_thread_aside(void);
 /* Called on a thread about to give the machine up, for a wait (1) or for
  * another thread's turn (0): for what a host keeps bound to the thread that
  * runs the guest, such as a graphics context. */

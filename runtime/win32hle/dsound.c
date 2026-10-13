@@ -128,6 +128,8 @@ enum { CLIP_FREE, CLIP_PLAYING, CLIP_DONE };
 
 static void mix(void *ud, Uint8 *stream, int len) {
     (void)ud;
+    static int aside;                                    /* SDL's thread, met here for the first time */
+    if (!aside) aside = 1, hle_thread_aside();
     int frames = len / 4;
     static float acc[2 * 8192];
     if (frames > 8192) frames = 8192;
