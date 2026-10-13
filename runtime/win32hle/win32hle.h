@@ -321,6 +321,12 @@ extern int         hle_d3d9_vsync;                    /* wait for the display at
  * game's own buffer and again in the window's once it has been copied there,
  * and the log told when either turns black and when it is a picture again. */
 extern int         hle_d3d9_stream, hle_d3d9_plain, hle_d3d9_watch_picture;
+/* For tests under an emulator whose glReadPixels fills only the first quarter
+ * of each row (Ryujinx): a read-back is put together from several, each
+ * asked wide enough for its first quarter to be the next columns wanted. A
+ * game that tries its render targets by reading one back then takes the
+ * paths it takes on a console. */
+extern int         hle_d3d9_read_quarter;
 extern const char *hle_d3d9_title;
 extern void      (*hle_d3d9_frame_hook)(unsigned frame);   /* after each Present, counted from 1 */
 /* Where time went, for a host that wants to say why its frames are long:

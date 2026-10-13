@@ -46,7 +46,7 @@ const char *hle_d3d9_title = "Direct3D";
 const char *volatile hle_d3d9_doing = "nothing";       /* what the drawing half is in the middle of, for a watchdog */
 #define DOING(what) (hle_d3d9_doing = (what))
 int hle_d3d9_vsync;
-int hle_d3d9_stream = 1, hle_d3d9_plain, hle_d3d9_watch_picture;
+int hle_d3d9_stream = 1, hle_d3d9_plain, hle_d3d9_watch_picture, hle_d3d9_read_quarter;
 static int g_swap_interval = -1;               /* what the window was last told of hle_d3d9_vsync */
 
 static SDL_Window *g_win;
@@ -479,6 +479,21 @@ static void apply_sampler(d3d9_texture *t) {
 }
 
 /* ---- pixels of a target, in and out -------------------------------------------------- */
+/* glReadPixels, or with hle_d3d9_read_quarter the same from as many reads as
+ * it takes when only the first quarter of each row read comes back: each
+ * asks for four times the columns still missing and keeps a quarter. */
+static void read_rgba(int x, int y, int w, int h, uint8_t *rgba) {
+    if (!hle_d3d9_read_quarter) { glReadPixels(x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba); return; }
+    uint8_t *part = malloc((size_t)(w > 4 ? w : 4) * (size_t)h * 4);
+    if (!part) return;
+    for (int done = 0; done < w;) {
+        int ask = w - done < 4 ? 4 : w - done, good = ask / 4;      /* the last columns: asked past the edge */
+        glReadPixels(x + done, y, ask, h, GL_RGBA, GL_UNSIGNED_BYTE, part);
+        for (int r = 0; r < h; r++) memcpy(rgba + ((size_t)r * (size_t)w + (size_t)done) * 4, part + (size_t)r * (size_t)ask * 4, (size_t)good * 4);
+        done += good;
+    }
+    free(part);
+}
 int d3d9_gl_read(d3d9_surface *s, int x, int y, int w, int h, uint8_t *bgra) {
     if (!gl_enter()) return -1;
     if (!drawn_into(s)) {                      /* nothing has touched it: black, without making it */
@@ -486,7 +501,7 @@ int d3d9_gl_read(d3d9_surface *s, int x, int y, int w, int h, uint8_t *bgra) {
         return 0;
     }
     bind_fbo(fbo_for(s, NULL));
-    glReadPixels(x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, bgra);
+    read_rgba(x, y, w, h, bgra);
     swap_rb(bgra, (size_t)w * (size_t)h);
     if (!d3d9_fmt_alpha(s->fmt)) for (size_t i = 0; i < (size_t)w * (size_t)h; i++) bgra[4 * i + 3] = 255;
     return 0;
