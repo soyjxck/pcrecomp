@@ -338,7 +338,8 @@ extern int         hle_d3d9_read_quarter;
 extern int         hle_d3d9_upload;
 /* A texture filled again and again with whole pictures is drawn with a GL
  * texture already holding the same picture when there is one, and nothing is
- * sent (d3d9_gl.c, "pictures GL has already"); 0 sends every one. */
+ * sent (d3d9_gl.c, "pictures GL has already"): how many pictures GL keeps so
+ * (512 unless a host says; at most 2048), 0 to send every one. */
 extern int         hle_d3d9_pictures;
 extern const char *hle_d3d9_title;
 extern void      (*hle_d3d9_frame_hook)(unsigned frame);   /* after each Present, counted from 1 */

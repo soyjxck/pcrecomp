@@ -450,11 +450,13 @@ static void row_to_rgba4(int fmt, const uint8_t *src, uint16_t *o, int n) {
  * texture has been filled whole again, its pixels are looked up among the
  * pictures sent before, compared in full (a hash only finds the candidate),
  * and on a match it is drawn with that picture's GL texture and nothing is
- * sent. Up to PICTURES of them (64 MB of GL's at 256x256 and eight bits a
- * channel, half that again of copies to compare with); the one looked up
- * longest ago and drawn by no texture now makes way. A texture whose pictures
- * keep missing (text written afresh, say) fills its own again for a while. */
-#define PICTURES 256
+ * sent. Up to hle_d3d9_pictures of them (512: 128 MB of GL's at 256x256 and
+ * eight bits a channel, half that again of copies to compare with; 256 held
+ * 97% of the fills of standing in a busy street, but only 82% of walking
+ * about in it on a console); the one looked up longest ago and drawn by no
+ * texture now makes way. A texture whose pictures keep missing (text written
+ * afresh, say) fills its own again for a while. */
+#define PICTURES 2048                          /* the most hle_d3d9_pictures may ask for */
 #define PICTURE_SIDE 256                       /* the largest side looked up */
 #define PICTURE_TRIES 16                       /* misses in a row before a texture is left to itself */
 #define PICTURE_REST 240                       /* fills it is left to itself before it tries again */
@@ -469,7 +471,7 @@ typedef struct d3d9_picture {
 static d3d9_picture g_pictures[PICTURES];
 static int g_npictures;
 static uint64_t g_picture_clock;
-int hle_d3d9_pictures = 1;
+int hle_d3d9_pictures = 512;
 
 static uint64_t picture_hash(const uint8_t *p, size_t n) {      /* four lanes, so that the multiplies overlap */
     uint64_t a = 0x9E3779B97F4A7C15ull, b = 0xBF58476D1CE4E5B9ull, c = 0x94D049BB133111EBull, d = n;
@@ -504,7 +506,7 @@ static d3d9_picture *picture_find(const d3d9_surface *s, uint64_t hash, int four
 static d3d9_picture *picture_make(const d3d9_surface *s, uint64_t hash, int four) {
     size_t n = (size_t)s->pitch * (size_t)s->h;
     d3d9_picture *p = NULL;
-    if (g_npictures < PICTURES) p = &g_pictures[g_npictures++];
+    if (g_npictures < hle_d3d9_pictures && g_npictures < PICTURES) p = &g_pictures[g_npictures++];
     else for (int i = 0; i < g_npictures; i++)
         if (!g_pictures[i].refs && (!p || g_pictures[i].used < p->used)) p = &g_pictures[i];
     if (!p) return NULL;
