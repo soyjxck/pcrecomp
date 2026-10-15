@@ -166,7 +166,7 @@ static GLuint target_texture(d3d9_surface *s) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        if (s->tex) s->tex->gl_min = s->tex->gl_mag = s->tex->gl_u = s->tex->gl_v = -1;
+        if (s->tex) s->tex->gl_samp.min = s->tex->gl_samp.mag = s->tex->gl_samp.u = s->tex->gl_samp.v = -1;
         GLuint f;
         glGenFramebuffers(1, &f);
         bind_fbo(f);
@@ -442,9 +442,119 @@ static void row_to_rgba4(int fmt, const uint8_t *src, uint16_t *o, int n) {
     }
 }
 
+/* ---- pictures GL has already ----------------------------------------------------
+ * A game that fills a texture again and again with whole pictures (Trails in
+ * the Sky FC: a 256x256 page for each person, a new picture at each step of
+ * their animation, some 280 a second in a busy street, out of about 250
+ * different ones) has each different picture sent to GL once. When such a
+ * texture has been filled whole again, its pixels are looked up among the
+ * pictures sent before, compared in full (a hash only finds the candidate),
+ * and on a match it is drawn with that picture's GL texture and nothing is
+ * sent. Up to PICTURES of them (64 MB of GL's at 256x256 and eight bits a
+ * channel, half that again of copies to compare with); the one looked up
+ * longest ago and drawn by no texture now makes way. A texture whose pictures
+ * keep missing (text written afresh, say) fills its own again for a while. */
+#define PICTURES 256
+#define PICTURE_SIDE 256                       /* the largest side looked up */
+#define PICTURE_TRIES 16                       /* misses in a row before a texture is left to itself */
+#define PICTURE_REST 240                       /* fills it is left to itself before it tries again */
+typedef struct d3d9_picture {
+    uint64_t hash, used;
+    int w, h, fmt, pitch, four;
+    uint8_t *bits;                             /* the guest's pixels it was made from */
+    GLuint gl;
+    d3d9_sampling samp;
+    int refs;                                  /* textures drawn with it now */
+} d3d9_picture;
+static d3d9_picture g_pictures[PICTURES];
+static int g_npictures;
+static uint64_t g_picture_clock;
+int hle_d3d9_pictures = 1;
+
+static uint64_t picture_hash(const uint8_t *p, size_t n) {      /* four lanes, so that the multiplies overlap */
+    uint64_t a = 0x9E3779B97F4A7C15ull, b = 0xBF58476D1CE4E5B9ull, c = 0x94D049BB133111EBull, d = n;
+    size_t i = 0;
+    for (; i + 32 <= n; i += 32) {
+        uint64_t w[4];
+        memcpy(w, p + i, 32);
+        a = (a ^ w[0]) * 0xFF51AFD7ED558CCDull, b = (b ^ w[1]) * 0xC4CEB9FE1A85EC53ull;
+        c = (c ^ w[2]) * 0xFF51AFD7ED558CCDull, d = (d ^ w[3]) * 0xC4CEB9FE1A85EC53ull;
+    }
+    for (; i < n; i++) a = (a ^ p[i]) * 0x100000001B3ull;
+    return a ^ (b >> 7 | b << 57) ^ (c >> 19 | c << 45) ^ (d >> 31 | d << 33);
+}
+static void level_rows(const d3d9_surface *s, int four, int x, int y, int w, int h, uint8_t *px) {
+    int bpp = d3d9_fmt_bytes(s->fmt);
+    for (int r = 0; r < h; r++) {
+        const uint8_t *row = (const uint8_t *)G2H(s->bits) + (size_t)(y + r) * (size_t)s->pitch + (size_t)x * (size_t)bpp;
+        if (four) row_to_rgba4(s->fmt, row, (uint16_t *)px + (size_t)r * (size_t)w, w);
+        else row_to_rgba(s->fmt, row, px + (size_t)r * (size_t)w * 4, w);
+    }
+}
+static d3d9_picture *picture_find(const d3d9_surface *s, uint64_t hash, int four) {
+    size_t n = (size_t)s->pitch * (size_t)s->h;
+    for (int i = 0; i < g_npictures; i++) {
+        d3d9_picture *p = &g_pictures[i];
+        if (p->hash == hash && p->w == s->w && p->h == s->h && p->fmt == s->fmt && p->pitch == s->pitch && p->four == four &&
+            !memcmp(p->bits, G2H(s->bits), n))
+            return p;
+    }
+    return NULL;
+}
+static d3d9_picture *picture_make(const d3d9_surface *s, uint64_t hash, int four) {
+    size_t n = (size_t)s->pitch * (size_t)s->h;
+    d3d9_picture *p = NULL;
+    if (g_npictures < PICTURES) p = &g_pictures[g_npictures++];
+    else for (int i = 0; i < g_npictures; i++)
+        if (!g_pictures[i].refs && (!p || g_pictures[i].used < p->used)) p = &g_pictures[i];
+    if (!p) return NULL;
+    int same = p->gl && p->w == s->w && p->h == s->h && p->four == four;
+    if (!p->bits || (size_t)p->pitch * (size_t)p->h != n) {
+        free(p->bits);
+        if ((p->bits = malloc(n)) == NULL) { p->hash = 0, p->w = 0; return NULL; }
+    }
+    uint8_t *px = scratch((size_t)s->w * (size_t)s->h * (four ? 2 : 4));
+    if (!px) return NULL;
+    level_rows(s, four, 0, 0, s->w, s->h, px);
+    if (!p->gl) glGenTextures(1, &p->gl);
+    bind_texture(p->gl);
+    GLenum type = four ? GL_UNSIGNED_SHORT_4_4_4_4 : GL_UNSIGNED_BYTE;
+    if (same) glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, s->w, s->h, GL_RGBA, type, px);
+    else {
+        glTexImage2D(GL_TEXTURE_2D, 0, four ? GL_RGBA4 : GL_RGBA8, s->w, s->h, 0, GL_RGBA, type, px);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+        p->samp = (d3d9_sampling){ -1, -1, -1, -1, 1 };
+    }
+    memcpy(p->bits, G2H(s->bits), n);
+    p->hash = hash, p->w = s->w, p->h = s->h, p->fmt = s->fmt, p->pitch = s->pitch, p->four = four;
+    return p;
+}
+/* The picture for a texture just filled whole, found or made; NULL to fill its own. */
+static d3d9_picture *picture_for(d3d9_texture *t) {
+    d3d9_surface *s = t->level[0];
+    if (!hle_d3d9_pictures || t->levels != 1 || t->refills < 2 || !s->bits || s->w > PICTURE_SIDE || s->h > PICTURE_SIDE)
+        return NULL;
+    if (t->picture_misses >= PICTURE_TRIES) {
+        if (++t->picture_misses < PICTURE_TRIES + PICTURE_REST) return NULL;
+        t->picture_misses = 0;
+    }
+    int four = (hle_d3d9_upload & 1) && four_bits(t->fmt);
+    uint64_t hash = picture_hash(G2H(s->bits), (size_t)s->pitch * (size_t)s->h);
+    d3d9_picture *p = picture_find(s, hash, four);
+    if (p) hle_perf.textures_seen++, t->picture_misses = 0;
+    else if ((p = picture_make(s, hash, four)) != NULL) t->picture_misses++;
+    if (p) p->used = ++g_picture_clock;
+    return p;
+}
+static void picture_let_go(d3d9_texture *t) {
+    if (t->gl_picture) t->gl_picture->refs--, t->gl_picture = NULL;
+}
+void d3d9_gl_forget_texture(d3d9_texture *t) { picture_let_go(t); }
+
+static GLuint drawn_name(const d3d9_texture *t) { return t->gl_picture ? t->gl_picture->gl : t->gl; }
 static GLuint texture_ready(d3d9_texture *t);
 static GLuint sampled_texture(d3d9_texture *t) {         /* timed when there is something to fill */
-    if (!(t->usage & D3DUSAGE_RENDERTARGET) && t->gl && !t->dirty) return t->gl;
+    if (!(t->usage & D3DUSAGE_RENDERTARGET) && t->gl && !t->dirty) return drawn_name(t);
     uint64_t t0 = hle_now_ns();
     GLuint gl = texture_ready(t);
     hle_perf.texture_ns += hle_now_ns() - t0, hle_perf.textures++;
@@ -455,14 +565,31 @@ static GLuint texture_ready(d3d9_texture *t) {
     int fresh = !t->gl;
     if (fresh) {
         glGenTextures(1, &t->gl);
-        t->gl_min = t->gl_mag = t->gl_u = t->gl_v = -1, t->gl_aniso = 1;
+        t->gl_samp = (d3d9_sampling){ -1, -1, -1, -1, 1 };
     }
-    if (!fresh && !t->dirty) return t->gl;
+    if (!fresh && !t->dirty) return drawn_name(t);
+    d3d9_surface *s0 = t->level[0];
+    const int *r0 = s0->dirty_rect;
+    int whole0 = s0->dirty && r0[0] == 0 && r0[1] == 0 && r0[2] == s0->w && r0[3] == s0->h;
     if (g_fills_said < 4000 && g_fills_said++ >= 0) {      /* HLE_D3D9_FILLS=N: what four thousand fills are of, after the first N */
         int levels = 0;
         for (int i = 0; i < t->levels; i++) levels += fresh || t->level[i]->dirty;
-        fprintf(stderr, "[d3d9] frame %u: a texture filled %s: %dx%d, format %d, %d of %d levels (under sub_%08X)\n", d3d9.frame,
-                fresh ? "for the first time" : "again", t->level[0]->w, t->level[0]->h, t->level[0]->fmt, levels, t->levels, g_cur_func);
+        fprintf(stderr, "[d3d9] frame %u: a texture filled %s: %dx%d, format %d, %d of %d levels (under sub_%08X); %dx%d of the first written\n",
+                d3d9.frame, fresh ? "for the first time" : "again", s0->w, s0->h, s0->fmt, levels, t->levels,
+                g_cur_func, s0->dirty ? r0[2] - r0[0] : 0, s0->dirty ? r0[3] - r0[1] : 0);
+    }
+    if (!fresh && whole0) {
+        t->refills++;
+        d3d9_picture *p = picture_for(t);
+        if (p) {
+            if (t->gl_picture != p) picture_let_go(t), p->refs++, t->gl_picture = p;
+            s0->dirty = 0, t->dirty = 0;
+            return p->gl;
+        }
+    }
+    if (t->gl_picture) {                       /* filled some other way: its own texture is behind on all of it */
+        picture_let_go(t);
+        d3d9_surface_touched(s0, 0, 0, s0->w, s0->h);
     }
     bind_texture(t->gl);
     if (fresh) glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, t->levels - 1);
@@ -475,16 +602,14 @@ static GLuint texture_ready(d3d9_texture *t) {
     for (int i = 0; i < t->levels; i++) {
         d3d9_surface *s = t->level[i];
         if (!fresh && !s->dirty) continue;
+        /* In place, only what was written since. */
+        int whole = fresh || !in_place;
+        int x = whole ? 0 : s->dirty_rect[0], y = whole ? 0 : s->dirty_rect[1];
+        int w = whole ? s->w : s->dirty_rect[2] - x, h = whole ? s->h : s->dirty_rect[3] - y;
         uint8_t *px = NULL;
-        if (s->bits && (px = scratch((size_t)s->w * (size_t)s->h * (four ? 2 : 4))) != NULL) {
-            for (int r = 0; r < s->h; r++) {
-                const uint8_t *row = (const uint8_t *)G2H(s->bits) + (size_t)r * (size_t)s->pitch;
-                if (four) row_to_rgba4(s->fmt, row, (uint16_t *)px + (size_t)r * (size_t)s->w, s->w);
-                else row_to_rgba(s->fmt, row, px + (size_t)r * (size_t)s->w * 4, s->w);
-            }
-        }
-        if (fresh || !in_place) glTexImage2D(GL_TEXTURE_2D, i, (GLint)inner, s->w, s->h, 0, GL_RGBA, type, px);
-        else if (px) glTexSubImage2D(GL_TEXTURE_2D, i, 0, 0, s->w, s->h, GL_RGBA, type, px);
+        if (s->bits && (px = scratch((size_t)w * (size_t)h * (four ? 2 : 4))) != NULL) level_rows(s, four, x, y, w, h, px);
+        if (whole) glTexImage2D(GL_TEXTURE_2D, i, (GLint)inner, s->w, s->h, 0, GL_RGBA, type, px);
+        else if (px) glTexSubImage2D(GL_TEXTURE_2D, i, x, y, w, h, GL_RGBA, type, px);
         s->dirty = 0;
     }
     t->dirty = 0;
@@ -492,6 +617,7 @@ static GLuint texture_ready(d3d9_texture *t) {
 }
 static void apply_sampler(d3d9_texture *t) {
     const uint32_t *ss = d3d9.ss[0];
+    d3d9_sampling *c = t->gl_picture ? &t->gl_picture->samp : &t->gl_samp;      /* what the GL texture bound has */
     int mips = t->levels > 1 && ss[D3DSAMP_MIPFILTER] != D3DTEXF_NONE;
     int lin = ss[D3DSAMP_MINFILTER] >= D3DTEXF_LINEAR;
     int min = !mips ? (lin ? GL_LINEAR : GL_NEAREST)
@@ -501,11 +627,11 @@ static void apply_sampler(d3d9_texture *t) {
     static const int wrap[] = { GL_REPEAT, GL_REPEAT, GL_MIRRORED_REPEAT, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE };
     int u = wrap[ss[D3DSAMP_ADDRESSU] < 6 ? ss[D3DSAMP_ADDRESSU] : 0], v = wrap[ss[D3DSAMP_ADDRESSV] < 6 ? ss[D3DSAMP_ADDRESSV] : 0];
     int aniso = ss[D3DSAMP_MINFILTER] == D3DTEXF_ANISOTROPIC && ss[D3DSAMP_MAXANISOTROPY] > 1 ? (int)ss[D3DSAMP_MAXANISOTROPY] : 1;
-    if (t->gl_min != min) glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, min), t->gl_min = min;
-    if (t->gl_mag != mag) glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, mag), t->gl_mag = mag;
-    if (t->gl_u != u) glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, u), t->gl_u = u;
-    if (t->gl_v != v) glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, v), t->gl_v = v;
-    if (g_have_aniso && t->gl_aniso != aniso) glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, (float)aniso), t->gl_aniso = aniso;
+    if (c->min != min) glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, min), c->min = min;
+    if (c->mag != mag) glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, mag), c->mag = mag;
+    if (c->u != u) glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, u), c->u = u;
+    if (c->v != v) glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, v), c->v = v;
+    if (g_have_aniso && c->aniso != aniso) glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, (float)aniso), c->aniso = aniso;
 }
 
 /* ---- pixels of a target, in and out -------------------------------------------------- */

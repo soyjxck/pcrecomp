@@ -93,19 +93,25 @@ typedef struct d3d9_surface {
     uint32_t bits;              /* the pixels in guest memory, top row first; 0 until someone wants them */
     int pitch;
     int dirty;                  /* the guest's pixels are newer than GL's */
+    int dirty_rect[4];          /* where: left, top, right, bottom of what was written since (d3d9_surface_touched) */
     int locked, lock_write;
+    int lock_rect[4];           /* what a write lock covers */
     unsigned gl_tex, gl_rb, gl_fbo;   /* a target's own texture, a depth buffer, a framebuffer to read or blit it */
 } d3d9_surface;
 
 #define D3D9_MAX_LEVELS 14
+typedef struct { int min, mag, u, v, aniso; } d3d9_sampling;   /* a GL texture's sampling, as GL was last told it */
+struct d3d9_picture;
 struct d3d9_texture {
     uint32_t self;
     int w, h, levels, fmt, usage, pool;
     d3d9_surface *level[D3D9_MAX_LEVELS];
     int dirty;                  /* some level is */
     unsigned gl;                /* 0 until first drawn with */
-    int gl_min, gl_mag, gl_u, gl_v, gl_aniso;   /* the sampling GL has for it */
-    int gl_four;                               /* GL holds it as four bits a channel */
+    d3d9_sampling gl_samp;
+    int gl_four;                /* GL holds it as four bits a channel */
+    struct d3d9_picture *gl_picture;   /* drawn with a picture GL has already (d3d9_gl.c), not with gl */
+    int refills, picture_misses;       /* how often it has been filled again whole; looked up in vain in a row */
 };
 
 typedef struct d3d9_buffer {
@@ -171,6 +177,7 @@ uint32_t d3d9_texture_new(int w, int h, int levels, int usage, int fmt, int pool
 uint8_t *d3d9_surface_read(d3d9_surface *s, int x, int y, int w, int h);
 void     d3d9_surface_write(d3d9_surface *s, int x, int y, int w, int h, const uint8_t *bgra);
 int      d3d9_surface_copy(d3d9_surface *to, int tx, int ty, d3d9_surface *from, int fx, int fy, int w, int h);
+void     d3d9_surface_touched(d3d9_surface *s, int x, int y, int w, int h);
 uint32_t d3d9_surface_bits(d3d9_surface *s);                             /* its guest pixels, made if need be */
 
 /* ---- the drawing half (d3d9_gl.c) ---- */
@@ -196,6 +203,7 @@ void d3d9_gl_upload(d3d9_surface *s, int x, int y, int w, int h, const uint8_t *
 void d3d9_gl_blit(d3d9_surface *from, const int *fr, d3d9_surface *to, const int *tr, int linear);
 void d3d9_gl_retire(unsigned tex, unsigned rb, unsigned fbo, unsigned buf);   /* GL names nothing uses any more */
 void d3d9_gl_forget_surface(const d3d9_surface *s);   /* it is going: drop framebuffers made with it */
+void d3d9_gl_forget_texture(d3d9_texture *t);         /* it is going: let go of the picture it is drawn with */
 int  d3d9_gl_max_texture(void);
 
 #endif /* D3D9_PRIV_H */

@@ -336,6 +336,10 @@ extern int         hle_d3d9_read_quarter;
  * 256x256 sprite page 0.25 ms at eight bits against 0.47 at four, Mesa 20.1
  * under Ryujinx). */
 extern int         hle_d3d9_upload;
+/* A texture filled again and again with whole pictures is drawn with a GL
+ * texture already holding the same picture when there is one, and nothing is
+ * sent (d3d9_gl.c, "pictures GL has already"); 0 sends every one. */
+extern int         hle_d3d9_pictures;
 extern const char *hle_d3d9_title;
 extern void      (*hle_d3d9_frame_hook)(unsigned frame);   /* after each Present, counted from 1 */
 /* Where time went, for a host that wants to say why its frames are long:
@@ -348,6 +352,7 @@ extern void      (*hle_d3d9_frame_hook)(unsigned frame);   /* after each Present
 typedef struct {
     uint64_t draw_ns, program_ns, texture_ns, clear_ns, present_ns, swap_ns, read_ns, read_bytes;
     unsigned draws, programs, textures, reads;
+    unsigned textures_seen;         /* of the textures filled, how many with a picture GL had already (nothing sent) */
     unsigned skipped;               /* draws, clears and presents not done: another thread kept the context */
     /* with hle_perf_phases set, a draw's time by what it was doing: finding
      * its program and texture, setting state, uniforms, vertices, the call */

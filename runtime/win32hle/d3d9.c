@@ -195,6 +195,7 @@ uint32_t d3d9_texture_new(int w, int h, int levels, int usage, int fmt, int pool
 }
 static void texture_free(d3d9_texture *t) {
     for (int i = 0; i < 8; i++) if (d3d9.tex[i] == t) d3d9.tex[i] = NULL;
+    d3d9_gl_forget_texture(t);
     for (int i = 0; i < t->levels; i++) surface_free(t->level[i]);
     d3d9_gl_retire(t->gl, 0, 0, 0);
     hle_guest_free(t->self);
@@ -235,6 +236,26 @@ void d3d9_surface_write(d3d9_surface *s, int x, int y, int w, int h, const uint8
     for (int r = 0; r < h; r++)
         d3d9_from_bgra(s->fmt, bgra + (size_t)r * (size_t)w * 4,
                        (uint8_t *)G2H(s->bits) + (size_t)(y + r) * (size_t)s->pitch + (size_t)x * (size_t)bpp, w);
+    d3d9_surface_touched(s, x, y, w, h);
+}
+/* The guest's pixels have changed in this rectangle: GL's copy is behind
+ * there, and only there (a sprite page refilled where one picture lies is
+ * sent up as that picture). */
+void d3d9_surface_touched(d3d9_surface *s, int x, int y, int w, int h) {
+    int x1 = x + w, y1 = y + h;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x1 > s->w) x1 = s->w;
+    if (y1 > s->h) y1 = s->h;
+    if (x1 <= x || y1 <= y) return;
+    int *r = s->dirty_rect;
+    if (!s->dirty) r[0] = x, r[1] = y, r[2] = x1, r[3] = y1;
+    else {
+        if (x < r[0]) r[0] = x;
+        if (y < r[1]) r[1] = y;
+        if (x1 > r[2]) r[2] = x1;
+        if (y1 > r[3]) r[3] = y1;
+    }
     s->dirty = 1;
     if (s->tex) s->tex->dirty = 1;
 }
@@ -255,8 +276,7 @@ int d3d9_surface_copy(d3d9_surface *to, int tx, int ty, d3d9_surface *from, int 
         memmove((uint8_t *)G2H(to->bits) + (size_t)(ty + r) * (size_t)to->pitch + (size_t)tx * (size_t)bpp,
                 (const uint8_t *)G2H(from->bits) + (size_t)(fy + r) * (size_t)from->pitch + (size_t)fx * (size_t)bpp, (size_t)w * (size_t)bpp);
     }
-    to->dirty = 1;
-    if (to->tex) to->tex->dirty = 1;
+    d3d9_surface_touched(to, tx, ty, w, h);
     return 1;
 }
 
@@ -337,6 +357,8 @@ static uint32_t surface_lock(d3d9_surface *s, uint32_t out, uint32_t rect, uint3
     if (rect) at += MEM32(rect + 4) * (uint32_t)s->pitch + MEM32(rect) * (uint32_t)d3d9_fmt_bytes(s->fmt);
     MEM32(out) = (uint32_t)s->pitch, MEM32(out + 4) = at;
     s->locked = 1, s->lock_write = !(flags & D3DLOCK_READONLY);
+    if (rect) for (int i = 0; i < 4; i++) s->lock_rect[i] = (int)MEM32(rect + 4u * (uint32_t)i);
+    else s->lock_rect[0] = s->lock_rect[1] = 0, s->lock_rect[2] = s->w, s->lock_rect[3] = s->h;
     return D3D_OK;
 }
 static uint32_t surface_unlock(d3d9_surface *s) {
@@ -350,8 +372,8 @@ static uint32_t surface_unlock(d3d9_surface *s) {
         free(px);
         return D3D_OK;
     }
-    s->dirty = 1;
-    if (s->tex) s->tex->dirty = 1;
+    const int *r = s->lock_rect;
+    d3d9_surface_touched(s, r[0], r[1], r[2] - r[0], r[3] - r[1]);
     return D3D_OK;
 }
 static void s_LockRect(void)   { RET(surface_lock(HOSTP(A32(0)), A32(1), A32(2), A32(3)), 4); }   /* (this, &locked, rect, flags) */
@@ -395,9 +417,13 @@ static void t_UnlockRect(void) {               /* (this, level) */
     if (A32(1) >= (uint32_t)t->levels) RET(D3DERR_INVALIDCALL, 2);
     RET(surface_unlock(t->level[A32(1)]), 2);
 }
+static void rect_of(uint32_t p, const d3d9_surface *s, int *r);
 static void t_AddDirtyRect(void) {             /* (this, rect) */
     d3d9_texture *t = HOSTP(A32(0));
-    t->level[0]->dirty = 1, t->dirty = 1;
+    d3d9_surface *s = t->level[0];
+    int r[4];
+    rect_of(A32(1), s, r);
+    d3d9_surface_touched(s, r[0], r[1], r[2] - r[0], r[3] - r[1]);
     RET(D3D_OK, 2);
 }
 
@@ -660,6 +686,7 @@ static void rect_of(uint32_t p, const d3d9_surface *s, int *r) {
 static void copy_rect(d3d9_surface *from, const int *fr, d3d9_surface *to, const int *tr) {
     int fw = fr[2] - fr[0], fh = fr[3] - fr[1], tw = tr[2] - tr[0], th = tr[3] - tr[1];
     if (fw <= 0 || fh <= 0 || tw <= 0 || th <= 0) return;
+    if (fw == tw && fh == th && d3d9_surface_copy(to, tr[0], tr[1], from, fr[0], fr[1], fw, fh)) return;
     uint8_t *px = d3d9_surface_read(from, fr[0], fr[1], fw, fh);
     if (px && (fw != tw || fh != th)) {
         uint8_t *sc = malloc((size_t)tw * (size_t)th * 4);
