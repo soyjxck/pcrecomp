@@ -46,7 +46,7 @@ const char *hle_d3d9_title = "Direct3D";
 const char *volatile hle_d3d9_doing = "nothing";       /* what the drawing half is in the middle of, for a watchdog */
 #define DOING(what) (hle_d3d9_doing = (what))
 int hle_d3d9_vsync;
-int hle_d3d9_stream = 1, hle_d3d9_plain, hle_d3d9_watch_picture, hle_d3d9_read_quarter;
+int hle_d3d9_stream = 1, hle_d3d9_plain, hle_d3d9_watch_picture, hle_d3d9_read_quarter, hle_d3d9_upload = 2;
 static int g_swap_interval = -1;               /* what the window was last told of hle_d3d9_vsync */
 
 static SDL_Window *g_win;
@@ -420,6 +420,27 @@ static void row_to_rgba(int fmt, const uint8_t *src, uint8_t *o, int n) {
     d3d9_to_bgra(fmt, src, o, n);
     swap_rb(o, (size_t)n);
 }
+/* Four bits a channel go to GL as four bits a channel (GL_RGBA4): the same
+ * pixels when sampled, a nibble being read as the nibble twice either way, and
+ * half the bytes to send. Only the order differs: Direct3D's A, R, G, B from
+ * the top bits down against GL's R, G, B, A. */
+static int four_bits(int fmt) { return fmt == D3DFMT_A4R4G4B4 || fmt == D3DFMT_X4R4G4B4; }
+static void row_to_rgba4(int fmt, const uint8_t *src, uint16_t *o, int n) {
+    uint16_t opaque = fmt == D3DFMT_X4R4G4B4 ? 15 : 0;
+    int i = 0;
+#if defined(__aarch64__)
+    uint16x8_t a = vdupq_n_u16(opaque);
+    for (; i + 8 <= n; i += 8) {
+        uint16x8_t v = vreinterpretq_u16_u8(vld1q_u8(src + 2 * i));
+        vst1q_u16(o + i, vorrq_u16(vsriq_n_u16(vshlq_n_u16(v, 4), v, 12), a));
+    }
+#endif
+    for (; i < n; i++) {
+        uint16_t v;
+        memcpy(&v, src + 2 * i, 2);
+        o[i] = (uint16_t)(v << 4 | v >> 12 | opaque);
+    }
+}
 
 static GLuint texture_ready(d3d9_texture *t);
 static GLuint sampled_texture(d3d9_texture *t) {         /* timed when there is something to fill */
@@ -445,15 +466,25 @@ static GLuint texture_ready(d3d9_texture *t) {
     }
     bind_texture(t->gl);
     if (fresh) glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, t->levels - 1);
+    /* Made once, at the size and format it keeps, and filled again in place
+     * (hle_d3d9_upload says which of these). */
+    int four = (hle_d3d9_upload & 1) && four_bits(t->fmt), in_place = (hle_d3d9_upload & 2) != 0;
+    if (fresh) t->gl_four = four;
+    four = t->gl_four;                         /* the switch moving later does not change what GL has */
+    GLenum inner = four ? GL_RGBA4 : GL_RGBA8, type = four ? GL_UNSIGNED_SHORT_4_4_4_4 : GL_UNSIGNED_BYTE;
     for (int i = 0; i < t->levels; i++) {
         d3d9_surface *s = t->level[i];
         if (!fresh && !s->dirty) continue;
         uint8_t *px = NULL;
-        if (s->bits && (px = scratch((size_t)s->w * (size_t)s->h * 4)) != NULL) {
-            for (int r = 0; r < s->h; r++)
-                row_to_rgba(s->fmt, (const uint8_t *)G2H(s->bits) + (size_t)r * (size_t)s->pitch, px + (size_t)r * (size_t)s->w * 4, s->w);
+        if (s->bits && (px = scratch((size_t)s->w * (size_t)s->h * (four ? 2 : 4))) != NULL) {
+            for (int r = 0; r < s->h; r++) {
+                const uint8_t *row = (const uint8_t *)G2H(s->bits) + (size_t)r * (size_t)s->pitch;
+                if (four) row_to_rgba4(s->fmt, row, (uint16_t *)px + (size_t)r * (size_t)s->w, s->w);
+                else row_to_rgba(s->fmt, row, px + (size_t)r * (size_t)s->w * 4, s->w);
+            }
         }
-        glTexImage2D(GL_TEXTURE_2D, i, GL_RGBA8, s->w, s->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        if (fresh || !in_place) glTexImage2D(GL_TEXTURE_2D, i, (GLint)inner, s->w, s->h, 0, GL_RGBA, type, px);
+        else if (px) glTexSubImage2D(GL_TEXTURE_2D, i, 0, 0, s->w, s->h, GL_RGBA, type, px);
         s->dirty = 0;
     }
     t->dirty = 0;

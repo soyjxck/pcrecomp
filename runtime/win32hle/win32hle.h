@@ -327,6 +327,15 @@ extern int         hle_d3d9_stream, hle_d3d9_plain, hle_d3d9_watch_picture;
  * game that tries its render targets by reading one back then takes the
  * paths it takes on a console. */
 extern int         hle_d3d9_read_quarter;
+/* How a texture the guest has filled again goes to GL: with bit 1 its pixels
+ * of four bits a channel as four bits a channel (GL_RGBA4, half the bytes)
+ * rather than eight; with bit 2 into the texture GL has (glTexSubImage2D)
+ * rather than by making it anew. 2 unless a host says otherwise: Mesa's
+ * llvmpipe and the Switch's nouveau both turn four bits a channel into
+ * another order pixel by pixel, which costs more than the bytes saved (a
+ * 256x256 sprite page 0.25 ms at eight bits against 0.47 at four, Mesa 20.1
+ * under Ryujinx). */
+extern int         hle_d3d9_upload;
 extern const char *hle_d3d9_title;
 extern void      (*hle_d3d9_frame_hook)(unsigned frame);   /* after each Present, counted from 1 */
 /* Where time went, for a host that wants to say why its frames are long:

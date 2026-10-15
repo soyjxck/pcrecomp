@@ -105,6 +105,7 @@ struct d3d9_texture {
     int dirty;                  /* some level is */
     unsigned gl;                /* 0 until first drawn with */
     int gl_min, gl_mag, gl_u, gl_v, gl_aniso;   /* the sampling GL has for it */
+    int gl_four;                               /* GL holds it as four bits a channel */
 };
 
 typedef struct d3d9_buffer {
@@ -169,6 +170,7 @@ uint32_t d3d9_texture_new(int w, int h, int levels, int usage, int fmt, int pool
 /* A rectangle of a surface as BGRA (malloc'd), wherever its pixels are; and put back. */
 uint8_t *d3d9_surface_read(d3d9_surface *s, int x, int y, int w, int h);
 void     d3d9_surface_write(d3d9_surface *s, int x, int y, int w, int h, const uint8_t *bgra);
+int      d3d9_surface_copy(d3d9_surface *to, int tx, int ty, d3d9_surface *from, int fx, int fy, int w, int h);
 uint32_t d3d9_surface_bits(d3d9_surface *s);                             /* its guest pixels, made if need be */
 
 /* ---- the drawing half (d3d9_gl.c) ---- */

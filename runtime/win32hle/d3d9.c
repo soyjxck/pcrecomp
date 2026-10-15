@@ -238,6 +238,27 @@ void d3d9_surface_write(d3d9_surface *s, int x, int y, int w, int h, const uint8
     s->dirty = 1;
     if (s->tex) s->tex->dirty = 1;
 }
+/* Pixels from one surface of the guest's into another of the same format, the
+ * rows as they are: what reading them out as four bytes a pixel and writing
+ * them back would give, since that way round gives every pixel back unchanged
+ * in these formats (in the X ones the unused bits would be set, so they go
+ * the long way). 0 if it cannot be done like this. A game that builds its
+ * sprites out of sheets asks for this hundreds of times a second. */
+int d3d9_surface_copy(d3d9_surface *to, int tx, int ty, d3d9_surface *from, int fx, int fy, int w, int h) {
+    int f = from->fmt, bpp = d3d9_fmt_bytes(f);
+    if (f != to->fmt || !bpp || on_gl(from) || on_gl(to) || !from->bits || f == D3DFMT_X8R8G8B8 || f == D3DFMT_X8B8G8R8 ||
+        f == D3DFMT_X1R5G5B5 || f == D3DFMT_X4R4G4B4 || !d3d9_surface_bits(to))
+        return 0;
+    int up = to == from && ty > fy;                 /* within one surface, downwards: the last row first */
+    for (int i = 0; i < h; i++) {
+        int r = up ? h - 1 - i : i;
+        memmove((uint8_t *)G2H(to->bits) + (size_t)(ty + r) * (size_t)to->pitch + (size_t)tx * (size_t)bpp,
+                (const uint8_t *)G2H(from->bits) + (size_t)(fy + r) * (size_t)from->pitch + (size_t)fx * (size_t)bpp, (size_t)w * (size_t)bpp);
+    }
+    to->dirty = 1;
+    if (to->tex) to->tex->dirty = 1;
+    return 1;
+}
 
 /* A level of a texture is counted with its texture; a surface of its own has
  * its own count, and the device's two are never given up. */

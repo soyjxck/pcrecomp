@@ -530,6 +530,7 @@ static void x_LoadSurfaceFromSurface(void) {
     if (fw <= 0 || fh <= 0 || tw <= 0 || th <= 0 || fr[0] < 0 || fr[1] < 0 || fr[2] > from->w || fr[3] > from->h ||
         tr[0] < 0 || tr[1] < 0 || tr[2] > to->w || tr[3] > to->h)
         RET(D3DERR_INVALIDCALL, 8);
+    if (fw == tw && fh == th && !A32(7) && d3d9_surface_copy(to, tr[0], tr[1], from, fr[0], fr[1], fw, fh)) RET(D3D_OK, 8);
     uint8_t *px = d3d9_surface_read(from, fr[0], fr[1], fw, fh);
     if (px && (fw != tw || fh != th)) { uint8_t *s = scaled(px, fw, fh, tw, th); free(px); px = s; }
     if (!px) RET(0x8007000Eu, 8);
