@@ -98,6 +98,8 @@ int hle_filetrace(void) {
 /* CreateFileA(name,access,share,sa,disp,flags,template). access GENERIC_READ
  * 0x80000000, GENERIC_WRITE 0x40000000; disp CREATE_NEW 1, CREATE_ALWAYS 2,
  * OPEN_EXISTING 3, OPEN_ALWAYS 4, TRUNCATE_EXISTING 5. */
+static void ini_forget(void);                            /* .ini profile, below */
+
 static void k_CreateFileA(void) {
     const char *name = ASTR(0);
     uint32_t access = A32(1), disp = A32(4);
@@ -112,6 +114,7 @@ static void k_CreateFileA(void) {
          * opened to change in place is copied there first) */
         int keep = (access & 0x40000000u) && (disp == 3 || disp == 4);
         struct stat there;
+        ini_forget();
         hle_host_path_for_write(name, path, sizeof path, keep);
         exists = stat(path, &there) == 0;
     } else {
@@ -399,12 +402,14 @@ static void k_RemoveDirectoryA(void) {
 }
 static void k_DeleteFileA(void) {
     char path[1024];
+    ini_forget();
     if (hle_host_path(ASTR(0), path, sizeof path) && unlink(path) == 0) RET(1, 1);
     hle_set_last_error(ERROR_FILE_NOT_FOUND);
     RET(0, 1);
 }
 static void k_MoveFileA(void) {
     char a[1024], b[1024];
+    ini_forget();
     hle_host_path(ASTR(0), a, sizeof a);
     hle_host_path(ASTR(1), b, sizeof b);
     if (rename(a, b) == 0) RET(1, 2);
@@ -414,6 +419,7 @@ static void k_MoveFileA(void) {
 static void k_CopyFileA(void) {                          /* (src, dst, failIfExists) */
     char a[1024], b[1024];
     int ok = 0;
+    ini_forget();
     hle_host_path(ASTR(0), a, sizeof a);
     int dst_exists = hle_host_path(ASTR(1), b, sizeof b);
     hle_host_path_for_write(ASTR(1), b, sizeof b, 0);
@@ -597,7 +603,17 @@ static void k_GetDriveTypeA(void) {
  * the one that was there, as on Windows. Where a file holds a key twice (an
  * older version of this code added a line for every write), the later one
  * counts, and the next write leaves one. Comments and blank lines are not
- * kept. */
+ * kept.
+ *
+ * The last file read or written stays in memory as that list, and a write
+ * that changes nothing is not made. A game that saves its settings key by
+ * key otherwise reads and rewrites the whole file for every key: Trails in
+ * the Sky FC writes all 63 of its own at each change on its OPTION screen,
+ * twice, which on a Switch's SD card was half a second a press. What is kept
+ * is the file as this process last read or wrote it, known by the name it
+ * was asked for by (finding a name's file on the disk reads its folders,
+ * which costs as much again); a file opened to write, deleted, moved or
+ * copied through the calls here forgets it. */
 typedef struct { char *sec, *key, *val; } ini_kv;
 static FILE *ini_open(const char *file, const char *mode) {
     char path[1024];
@@ -653,46 +669,61 @@ static void ini_save(const char *file, const ini_kv *kv, int n) {
     }
     fclose(f);
 }
+static struct { int known; char name[1024]; ini_kv *kv; int n; } g_ini;
+static void ini_forget(void) {
+    if (g_ini.known) ini_free(g_ini.kv, g_ini.n);
+    g_ini.known = 0, g_ini.kv = NULL, g_ini.n = 0;
+}
+/* The file's list, read now unless it is the one kept; NULL for no file. */
+static ini_kv **ini_kept(const char *file, int **n) {
+    if (!file) return NULL;
+    if (!g_ini.known || strcmp(file, g_ini.name)) {
+        ini_forget();
+        g_ini.n = ini_load(file, &g_ini.kv);
+        snprintf(g_ini.name, sizeof g_ini.name, "%s", file);
+        g_ini.known = 1;
+    }
+    *n = &g_ini.n;
+    return &g_ini.kv;
+}
 static void k_GetPrivateProfileStringA(void) {           /* (sec,key,def,buf,size,file) */
     const char *sec = ASTR(0), *key = ASTR(1), *def = ASTR(2);
     char *buf = ASTR(3); uint32_t size = A32(4);
-    ini_kv *kv;
-    int n = ini_load(ASTR(5), &kv), at = sec && key ? ini_find(kv, n, sec, key) : -1;
-    if (buf && size) { strncpy(buf, at >= 0 ? kv[at].val : def ? def : "", size - 1); buf[size - 1] = 0; }
-    ini_free(kv, n);
+    int *n;
+    ini_kv **kv = ini_kept(ASTR(5), &n);
+    int at = kv && sec && key ? ini_find(*kv, *n, sec, key) : -1;
+    if (buf && size) { strncpy(buf, at >= 0 ? (*kv)[at].val : def ? def : "", size - 1); buf[size - 1] = 0; }
     RET(buf ? (uint32_t)strlen(buf) : 0u, 6);
 }
 static void k_GetPrivateProfileIntA(void) {              /* (sec,key,def,file) */
     const char *sec = ASTR(0), *key = ASTR(1);
-    ini_kv *kv;
-    int n = ini_load(ASTR(3), &kv), at = sec && key ? ini_find(kv, n, sec, key) : -1;
-    uint32_t v = at >= 0 ? (uint32_t)atoi(kv[at].val) : A32(2);
-    ini_free(kv, n);
-    RET(v, 4);
+    int *n;
+    ini_kv **kv = ini_kept(ASTR(3), &n);
+    int at = kv && sec && key ? ini_find(*kv, *n, sec, key) : -1;
+    RET(at >= 0 ? (uint32_t)atoi((*kv)[at].val) : A32(2), 4);
 }
-/* A NULL value takes the key out, a NULL key the whole section. */
+/* A NULL value takes the key out, a NULL key the whole section. The file is
+ * written only when its list has changed. */
 static void k_WritePrivateProfileStringA(void) {         /* (sec,key,val,file) */
     const char *sec = ASTR(0), *key = ASTR(1), *val = ASTR(2), *file = ASTR(3);
-    ini_kv *kv;
-    int n, at;
-    if (!file || !sec) RET(0, 4);
-    n = ini_load(file, &kv);
+    int *n, at, changed = 0;
+    ini_kv **kv;
+    if (!file || !sec || !(kv = ini_kept(file, &n))) RET(0, 4);
     if (!key || !val) {
-        for (int i = 0; i < n; i++)
-            if (!strcasecmp(kv[i].sec, sec) && (!key || !strcasecmp(kv[i].key, key))) {
-                free(kv[i].sec), free(kv[i].key), free(kv[i].val);
-                memmove(&kv[i], &kv[i + 1], (size_t)(n - i - 1) * sizeof *kv);
-                n--, i--;
+        for (int i = 0; i < *n; i++)
+            if (!strcasecmp((*kv)[i].sec, sec) && (!key || !strcasecmp((*kv)[i].key, key))) {
+                free((*kv)[i].sec), free((*kv)[i].key), free((*kv)[i].val);
+                memmove(&(*kv)[i], &(*kv)[i + 1], (size_t)(*n - i - 1) * sizeof **kv);
+                (*n)--, i--, changed = 1;
             }
-    } else if ((at = ini_find(kv, n, sec, key)) >= 0) {
-        free(kv[at].val);
-        kv[at].val = strdup(val);
+    } else if ((at = ini_find(*kv, *n, sec, key)) >= 0) {
+        if (strcmp((*kv)[at].val, val)) free((*kv)[at].val), (*kv)[at].val = strdup(val), changed = 1;
     } else {
-        kv = realloc(kv, (size_t)(n + 1) * sizeof *kv);
-        kv[n].sec = strdup(sec), kv[n].key = strdup(key), kv[n].val = strdup(val), n++;
+        *kv = realloc(*kv, (size_t)(*n + 1) * sizeof **kv);
+        (*kv)[*n].sec = strdup(sec), (*kv)[*n].key = strdup(key), (*kv)[*n].val = strdup(val), (*n)++;
+        changed = 1;
     }
-    ini_save(file, kv, n);
-    ini_free(kv, n);
+    if (changed) ini_save(file, *kv, *n);
     RET(1, 4);
 }
 

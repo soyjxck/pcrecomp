@@ -1,7 +1,9 @@
 /*
  * kernel32_ext_selftest.c - drives the file-I/O, Global*, and .ini shims from a
  * synthetic lifted guest: write a file and read it back, round-trip a Global
- * block, and write then read an .ini key. Headless, no game. Build -m32.
+ * block, and write then read an .ini key (a write of the same value leaves
+ * the file alone, DeleteFileA forgets the file kept). Headless, no game.
+ * Build -m32.
  */
 #define RECOMP_GENERATED_CODE
 #define _GNU_SOURCE
@@ -24,7 +26,7 @@ static void ok(const char *w, int c) { if (!c) { printf("FAIL %s\n", w); fails++
     uint32_t _cf = 0; uint32_t _flag_k = FK_NONE; uint32_t _flag_a = 0, _flag_b = 0; RECOMP_ENTER(va)
 
 static uint32_t V_Create, V_Read, V_Write, V_Close, V_GAlloc, V_GLock, V_GFree,
-                V_WriteIni, V_GetIni;
+                V_WriteIni, V_GetIni, V_Delete;
 
 /* scratch guest memory */
 static char     g_path[]  = "/tmp/win32hle_k32ext.dat";
@@ -32,13 +34,24 @@ static char     g_ini[]   = "/tmp/win32hle_k32ext.ini";
 static char     g_sec[]   = "video";
 static char     g_key[]   = "width";
 static char     g_val[]   = "1024";
+static char     g_val2[]  = "2048";
 static uint8_t  g_payload[16] = { 1,2,3,4,5,6,7,8, 9,10,11,12,13,14,15,16 };
 /* ...and in guest memory, where the guest passes and the shims fill them */
-static uint32_t v_path, v_ini, v_sec, v_key, v_val, v_payload, v_readbuf, v_inibuf, v_io;
+static uint32_t v_path, v_ini, v_sec, v_key, v_val, v_val2, v_payload, v_readbuf, v_inibuf, v_io;
 
 static int mem_eq;
 static uint32_t g_global_ptr;
-static int ini_ok;
+static int ini_ok, ini_same_left, ini_change_written, ini_delete_forgot;
+
+/* Does the .ini file hold this text? */
+static int ini_holds(const char *text) {
+    char all[4096] = "";
+    FILE *f = fopen(g_ini, "r");
+    size_t n = f ? fread(all, 1, sizeof all - 1, f) : 0;
+    if (f) fclose(f);
+    all[n] = 0;
+    return strstr(all, text) != NULL;
+}
 
 static void guest(void) {
     GUEST_PROLOGUE(ENTRY_VA);
@@ -84,6 +97,29 @@ static void guest(void) {
     RECOMP_ICALL(V_GetIni);
     ini_ok = strcmp((const char *)G2H(v_inibuf), "1024") == 0;
 
+    /* a comment put in from outside: a write of the same value leaves it (no
+     * rewrite, which keeps no comments), a change rewrites the file */
+    {
+        FILE *f = fopen(g_ini, "a");
+        if (f) fputs(";marker\r\n", f), fclose(f);
+    }
+    PUSH32(esp, v_ini); PUSH32(esp, v_val);
+    PUSH32(esp, v_key); PUSH32(esp, v_sec);
+    RECOMP_ICALL(V_WriteIni);
+    ini_same_left = ini_holds(";marker");
+    PUSH32(esp, v_ini); PUSH32(esp, v_val2);
+    PUSH32(esp, v_key); PUSH32(esp, v_sec);
+    RECOMP_ICALL(V_WriteIni);
+    ini_change_written = !ini_holds(";marker") && ini_holds("width=2048");
+
+    /* DeleteFileA, and the key is gone: the file kept is forgotten */
+    PUSH32(esp, v_ini); RECOMP_ICALL(V_Delete);
+    PUSH32(esp, v_ini); PUSH32(esp, 64);
+    PUSH32(esp, v_inibuf); PUSH32(esp, 0 /*default*/);
+    PUSH32(esp, v_key); PUSH32(esp, v_sec);
+    RECOMP_ICALL(V_GetIni);
+    ini_delete_forgot = ((const char *)G2H(v_inibuf))[0] == 0;
+
     eax = 0;
 }
 
@@ -103,11 +139,13 @@ int main(void) {
     V_GFree    = hle_resolve("GlobalFree");
     V_WriteIni = hle_resolve("WritePrivateProfileStringA");
     V_GetIni   = hle_resolve("GetPrivateProfileStringA");
+    V_Delete   = hle_resolve("DeleteFileA");
     ok("all kernel32_ext shims resolve",
-       V_Create && V_Read && V_Write && V_Close && V_GAlloc && V_GLock && V_GFree && V_WriteIni && V_GetIni);
+       V_Create && V_Read && V_Write && V_Close && V_GAlloc && V_GLock && V_GFree && V_WriteIni && V_GetIni && V_Delete);
 
     v_path = hle_guest_strdup(g_path), v_ini = hle_guest_strdup(g_ini);
     v_sec = hle_guest_strdup(g_sec), v_key = hle_guest_strdup(g_key), v_val = hle_guest_strdup(g_val);
+    v_val2 = hle_guest_strdup(g_val2);
     v_payload = hle_guest_static(g_payload, sizeof g_payload);
     v_readbuf = hle_guest_alloc(16), v_inibuf = hle_guest_alloc(64), v_io = hle_guest_alloc(4);
 
@@ -118,6 +156,9 @@ int main(void) {
     ok("file write then read round-trips", mem_eq);
     ok("GlobalAlloc/Lock write-through",    g_global_ptr);
     ok(".ini write then read round-trips",  ini_ok);
+    ok(".ini: the same value again leaves the file alone", ini_same_left);
+    ok(".ini: a changed value rewrites the file", ini_change_written);
+    ok(".ini: DeleteFileA forgets the file kept", ini_delete_forgot);
 
     /* A mod's overlay: its file read instead of the game's, the game's where
      * it has none, writes into the overlay (the game's file copied first when
