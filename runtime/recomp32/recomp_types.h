@@ -404,7 +404,22 @@ enum {
 
 static inline uint32_t recomp_parity8(uint8_t v);
 
-static inline int recomp_cond(uint32_t kind, uint32_t a, uint32_t b, int cc) {
+/* The lifter writes every conditional jump as a call of recomp_cond_cf with
+ * the flag kind it has just stored, so that where the kind and the condition
+ * are known, as they nearly always are, the call folds down to the one compare
+ * the guest made. That needs the call inlined, and a compiler at -O1 finds the
+ * body too big to, so it is made to (RECOMP_FLAGS_INLINE): in a particle
+ * update of Trails in the Sky FC, 89 calls a run became none, and the code
+ * smaller. */
+#ifndef RECOMP_FLAGS_INLINE
+#if defined(__GNUC__)
+#define RECOMP_FLAGS_INLINE __attribute__((always_inline)) static inline
+#else
+#define RECOMP_FLAGS_INLINE static __forceinline
+#endif
+#endif
+
+RECOMP_FLAGS_INLINE int recomp_cond(uint32_t kind, uint32_t a, uint32_t b, int cc) {
     uint32_t r, sh = FK_SHIFT(kind);
     int zf, sf, cf, of, pf;
 
@@ -495,7 +510,7 @@ decide:
 /* x87 compare outcome: -1 less, 0 equal, 1 greater, 2 unordered (a NaN). */
 #define FPU_CMP(x, y) ((x) < (y) ? -1 : (x) > (y) ? 1 : (x) == (y) ? 0 : 2)
 
-static inline int recomp_cond_cf(uint32_t kind, uint32_t a, uint32_t b, int cc,
+RECOMP_FLAGS_INLINE int recomp_cond_cf(uint32_t kind, uint32_t a, uint32_t b, int cc,
                                  uint32_t cf) {
     if ((FK_KIND(kind) == FK_INC || FK_KIND(kind) == FK_DEC) &&
         (cc == CC_B || cc == CC_AE || cc == CC_A || cc == CC_BE)) {
@@ -564,7 +579,7 @@ static inline uint32_t recomp_flags_pack(uint32_t r, uint32_t cf, uint32_t af,
  * does not silently drop a flag it never mentions. Hardware leaves AF
  * undefined after a logic op; this reports 0 there, deterministically.
  */
-static inline uint32_t recomp_eflags(uint32_t kind, uint32_t a, uint32_t b,
+RECOMP_FLAGS_INLINE uint32_t recomp_eflags(uint32_t kind, uint32_t a, uint32_t b,
                                      uint32_t cf_in, int df) {
     uint32_t r, e, sh = FK_SHIFT(kind);
     uint32_t cf = cf_in & 1u, of = 0, af = 0;
