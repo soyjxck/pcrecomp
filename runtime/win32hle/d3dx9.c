@@ -60,6 +60,10 @@ static void m_mul(float *r, const float *a, const float *b) {
     memcpy(r, t, 64);
 }
 #endif
+/* D3DXMatrixMultiply's arithmetic for a host that does in C what a game's
+ * own code does with it, so that its results are the call's to the bit
+ * (Trails in the Sky FC's src/common/hot.c). r may be a or b. */
+void hle_d3dx_matrix_multiply(float *r, const float *a, const float *b) { m_mul(r, a, b); }
 static int m_inverse(float *r, const float *m, float *det_out) {
     float inv[16], det;
     inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
