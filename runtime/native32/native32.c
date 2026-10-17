@@ -265,7 +265,10 @@ int native32_in_guest(uint32_t va) {
 
 /* native32_hold_image: see the header. The child is marked by an environment
  * variable, so it never launches again; the standard handles are passed on
- * explicitly, so a harness reading a pipe sees the child's output. */
+ * explicitly, so a harness reading a pipe sees the child's output. A launcher
+ * without a console (one that let its own go, writing to a file instead)
+ * starts the child without one too: Windows would otherwise open a window for
+ * it. */
 #define NATIVE32_HELD_ENV "NATIVE32_HELD"
 
 int native32_hold_image(const char* path, uint32_t base) {
@@ -294,7 +297,8 @@ int native32_hold_image(const char* path, uint32_t base) {
         if (std[i] && std[i] != INVALID_HANDLE_VALUE) SetHandleInformation(std[i], HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
     GetModuleFileNameA(NULL, me, MAX_PATH);
     SetEnvironmentVariableA(NATIVE32_HELD_ENV, "1");
-    BOOL made = CreateProcessA(me, GetCommandLineA(), NULL, NULL, TRUE, CREATE_SUSPENDED, NULL, NULL, &si, &pi);
+    DWORD how = CREATE_SUSPENDED | (GetConsoleWindow() ? 0 : CREATE_NO_WINDOW);
+    BOOL made = CreateProcessA(me, GetCommandLineA(), NULL, NULL, TRUE, how, NULL, NULL, &si, &pi);
     SetEnvironmentVariableA(NATIVE32_HELD_ENV, NULL);
     if (!made) {
         fprintf(stderr, "[native32] cannot start the host again (error %lu)\n", GetLastError());
